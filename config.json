@@ -1,0 +1,12 @@
+{
+    "api_key": "",
+    "primary_model": "gemini-2.5-pro-preview-tts",
+    "fallback_model": "gemini-2.5-flash-preview-tts",
+    "enable_fallback": true,
+    "voice_name": "Zephyr",
+    "temperature": 1.0,
+    "note_type_configs": [],
+    "skip_existing_audio": true,
+    "retry_attempts": 3,
+    "retry_delay": 2
+}

@@ -1,0 +1,11 @@
+{
+    "package": "anki_gemini_tts",
+    "name": "Gemini TTS Batch Addon",
+    "author": "Your Name",
+    "version": "1.0.0",
+    "description": "Batch add Text-to-Speech to Anki notes using Google Gemini API",
+    "homepage": "https://github.com/yourusername/anki-gemini-tts",
+    "conflicts": [],
+    "min_point_version": 45,
+    "max_point_version": 0
+}
