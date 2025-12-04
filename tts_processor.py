@@ -39,11 +39,19 @@ class TTSProcessor:
         
         if not text or not text.strip():
             return None, usage_stats
-            
+
+        # --- FIX: Combine instruction with text instead of using config.system_instruction ---
+        # The API currently returns 500 if system_instruction is passed in config for Audio
+        final_text = text
+        if self.system_instruction and self.system_instruction.strip():
+            # We combine them. Example: "Speak cheerfully: Hello world"
+            # We add a newline to separate instruction from content clearly
+            final_text = f"{self.system_instruction.strip()}\n{text}"
+
         contents = [
             types.Content(
                 role="user",
-                parts=[types.Part.from_text(text=text)],
+                parts=[types.Part.from_text(text=final_text)],
             ),
         ]
         
@@ -58,13 +66,8 @@ class TTSProcessor:
                     )
                 )
             ),
+            # system_instruction field removed to prevent 500 error
         )
-
-        # Add system instruction if present
-        if self.system_instruction and self.system_instruction.strip():
-            generate_content_config.system_instruction = [
-                types.Part.from_text(text=self.system_instruction)
-            ]
         
         for attempt in range(max_retries):
             try:
