@@ -5,10 +5,9 @@ Configuration Dialog for Gemini TTS Addon
 from aqt.qt import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
                      QPushButton, QComboBox, QCheckBox, QGroupBox, QFormLayout,
                      QListWidget, QListWidgetItem, QDialogButtonBox, QSpinBox,
-                     QDoubleSpinBox)
-from aqt.utils import showInfo
+                     QDoubleSpinBox, QTabWidget, QWidget, QTextEdit, QMessageBox, QInputDialog)
+from aqt.utils import showInfo, askUser
 from aqt import mw
-
 
 class NoteTypeConfigDialog(QDialog):
     """Dialog for configuring field mappings for a note type"""
@@ -71,78 +70,152 @@ class NoteTypeConfigDialog(QDialog):
 
 
 class ConfigDialog(QDialog):
-    """Main configuration dialog for the addon"""
+    """Main configuration dialog with Profiles support"""
     
-    def __init__(self, parent, config):
+    def __init__(self, parent, global_config):
         super().__init__(parent)
-        self.config = config
+        self.global_config = global_config
+        
+        # Ensure profiles exist in structure
+        if 'profiles' not in self.global_config:
+            self.global_config = {
+                'current_profile': 'Default',
+                'profiles': {'Default': self.global_config}
+            }
+            
+        self.current_profile_name = self.global_config.get('current_profile', 'Default')
+        self.profiles = self.global_config.get('profiles', {})
+        
+        # Ensure Default profile exists
+        if not self.profiles:
+            self.profiles['Default'] = self.get_default_profile()
+            self.current_profile_name = 'Default'
+
         self.setup_ui()
+        self.load_profile(self.current_profile_name)
+        
+    def get_default_profile(self):
+        return {
+            'api_key': '',
+            'primary_model': 'gemini-2.5-flash-tts',
+            'fallback_model': 'gemini-2.5-flash-tts',
+            'enable_fallback': True,
+            'voice_name': 'Zephyr',
+            'temperature': 1.0,
+            'system_instruction': '',
+            'note_type_configs': [],
+            'skip_existing_audio': True,
+            'retry_attempts': 3,
+            'retry_delay': 2,
+            'stats': {'requests': 0, 'input_tokens': 0, 'output_tokens': 0}
+        }
         
     def setup_ui(self):
         self.setWindowTitle("Gemini TTS Configuration")
-        self.setMinimumWidth(500)
+        self.setMinimumWidth(600)
+        self.setMinimumHeight(500)
+        
+        main_layout = QVBoxLayout()
+        
+        # --- Profile Management Section ---
+        profile_group = QGroupBox("Profiles")
+        profile_layout = QHBoxLayout()
+        
+        self.profile_combo = QComboBox()
+        self.profile_combo.addItems(sorted(self.profiles.keys()))
+        self.profile_combo.setCurrentText(self.current_profile_name)
+        self.profile_combo.currentTextChanged.connect(self.on_profile_change)
+        
+        add_btn = QPushButton("+")
+        add_btn.setFixedWidth(30)
+        add_btn.clicked.connect(self.add_profile)
+        
+        rename_btn = QPushButton("Rename")
+        rename_btn.clicked.connect(self.rename_profile)
+        
+        del_btn = QPushButton("Delete")
+        del_btn.clicked.connect(self.delete_profile)
+        
+        profile_layout.addWidget(QLabel("Current Profile:"))
+        profile_layout.addWidget(self.profile_combo, 1)
+        profile_layout.addWidget(add_btn)
+        profile_layout.addWidget(rename_btn)
+        profile_layout.addWidget(del_btn)
+        
+        profile_group.setLayout(profile_layout)
+        main_layout.addWidget(profile_group)
+
+        # --- Tabs for Settings ---
+        self.tabs = QTabWidget()
+        
+        # Tab 1: API & Voice
+        self.tab_api = QWidget()
+        self.setup_api_tab()
+        self.tabs.addTab(self.tab_api, "API & Voice")
+        
+        # Tab 2: Note Types
+        self.tab_notes = QWidget()
+        self.setup_notes_tab()
+        self.tabs.addTab(self.tab_notes, "Note Mappings")
+        
+        # Tab 3: Processing & Stats
+        self.tab_proc = QWidget()
+        self.setup_proc_tab()
+        self.tabs.addTab(self.tab_proc, "Settings & Stats")
+        
+        main_layout.addWidget(self.tabs)
+        
+        # Dialog buttons
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | 
+                                   QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        main_layout.addWidget(buttons)
+        
+        self.setLayout(main_layout)
+
+    def setup_api_tab(self):
         layout = QVBoxLayout()
+        form = QFormLayout()
         
-        # API Settings
-        api_group = QGroupBox("API Settings")
-        api_layout = QFormLayout()
-        
-        self.api_key = QLineEdit(self.config.get('api_key', ''))
+        self.api_key = QLineEdit()
         self.api_key.setEchoMode(QLineEdit.EchoMode.Password)
-        api_layout.addRow("Gemini API Key:", self.api_key)
+        form.addRow("Gemini API Key:", self.api_key)
         
-        self.primary_model = QLineEdit(self.config.get('primary_model', 
-                                                       'gemini-2.5-pro-preview-tts'))
-        api_layout.addRow("Primary Model:", self.primary_model)
+        self.primary_model = QLineEdit()
+        form.addRow("Primary Model:", self.primary_model)
         
-        self.fallback_model = QLineEdit(self.config.get('fallback_model',
-                                                        'gemini-2.5-flash-preview-tts'))
-        api_layout.addRow("Fallback Model:", self.fallback_model)
+        self.fallback_model = QLineEdit()
+        form.addRow("Fallback Model:", self.fallback_model)
         
         self.enable_fallback = QCheckBox("Enable fallback on rate limit")
-        self.enable_fallback.setChecked(self.config.get('enable_fallback', True))
-        api_layout.addRow("", self.enable_fallback)
+        form.addRow("", self.enable_fallback)
         
-        self.voice_name = QLineEdit(self.config.get('voice_name', 'Zephyr'))
-        api_layout.addRow("Voice Name:", self.voice_name)
+        self.voice_name = QLineEdit()
+        form.addRow("Voice Name:", self.voice_name)
         
         self.temperature = QDoubleSpinBox()
         self.temperature.setRange(0.0, 2.0)
         self.temperature.setSingleStep(0.1)
-        self.temperature.setValue(self.config.get('temperature', 1.0))
-        api_layout.addRow("Temperature:", self.temperature)
+        form.addRow("Temperature:", self.temperature)
         
-        api_group.setLayout(api_layout)
-        layout.addWidget(api_group)
+        layout.addLayout(form)
         
-        # Processing Settings
-        proc_group = QGroupBox("Processing Settings")
-        proc_layout = QFormLayout()
+        # System Instruction
+        layout.addWidget(QLabel("System Instructions (Optional):"))
+        self.system_instruction = QTextEdit()
+        self.system_instruction.setPlaceholderText("E.g., Speak slowly and clearly. Act like a helpful language tutor.")
+        self.system_instruction.setMaximumHeight(100)
+        layout.addWidget(self.system_instruction)
         
-        self.skip_existing = QCheckBox("Skip notes with existing audio")
-        self.skip_existing.setChecked(self.config.get('skip_existing_audio', True))
-        proc_layout.addRow("", self.skip_existing)
-        
-        self.retry_attempts = QSpinBox()
-        self.retry_attempts.setRange(1, 10)
-        self.retry_attempts.setValue(self.config.get('retry_attempts', 3))
-        proc_layout.addRow("Retry Attempts:", self.retry_attempts)
-        
-        self.retry_delay = QSpinBox()
-        self.retry_delay.setRange(1, 30)
-        self.retry_delay.setValue(self.config.get('retry_delay', 2))
-        proc_layout.addRow("Retry Delay (sec):", self.retry_delay)
-        
-        proc_group.setLayout(proc_layout)
-        layout.addWidget(proc_group)
-        
-        # Note Type Configurations
-        note_group = QGroupBox("Note Type Field Mappings")
-        note_layout = QVBoxLayout()
+        layout.addStretch()
+        self.tab_api.setLayout(layout)
+
+    def setup_notes_tab(self):
+        layout = QVBoxLayout()
         
         self.note_configs = QListWidget()
-        self.load_note_configs()
-        note_layout.addWidget(self.note_configs)
+        layout.addWidget(self.note_configs)
         
         btn_layout = QHBoxLayout()
         add_btn = QPushButton("Add Mapping")
@@ -155,41 +228,187 @@ class ConfigDialog(QDialog):
         btn_layout.addWidget(add_btn)
         btn_layout.addWidget(edit_btn)
         btn_layout.addWidget(remove_btn)
-        note_layout.addLayout(btn_layout)
+        layout.addLayout(btn_layout)
         
-        note_group.setLayout(note_layout)
-        layout.addWidget(note_group)
+        self.tab_notes.setLayout(layout)
+
+    def setup_proc_tab(self):
+        layout = QVBoxLayout()
         
-        # Dialog buttons
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | 
-                                   QDialogButtonBox.StandardButton.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        # Settings
+        group_sets = QGroupBox("Processing Settings")
+        form = QFormLayout()
         
-        self.setLayout(layout)
+        self.skip_existing = QCheckBox("Skip notes with existing audio")
+        form.addRow("", self.skip_existing)
         
-    def load_note_configs(self):
+        self.retry_attempts = QSpinBox()
+        self.retry_attempts.setRange(1, 10)
+        form.addRow("Retry Attempts:", self.retry_attempts)
+        
+        self.retry_delay = QSpinBox()
+        self.retry_delay.setRange(1, 30)
+        form.addRow("Retry Delay (sec):", self.retry_delay)
+        
+        group_sets.setLayout(form)
+        layout.addWidget(group_sets)
+        
+        # Stats Monitor
+        group_stats = QGroupBox("Profile Usage Statistics")
+        stats_layout = QFormLayout()
+        
+        self.stat_requests = QLabel("0")
+        self.stat_input = QLabel("0")
+        self.stat_output = QLabel("0")
+        
+        stats_layout.addRow("Total Requests:", self.stat_requests)
+        stats_layout.addRow("Input Tokens:", self.stat_input)
+        stats_layout.addRow("Output Tokens:", self.stat_output)
+        
+        group_stats.setLayout(stats_layout)
+        layout.addWidget(group_stats)
+        
+        layout.addStretch()
+        self.tab_proc.setLayout(layout)
+
+    # --- Profile Logic ---
+    
+    def on_profile_change(self, new_name):
+        if not new_name: return
+        # Save current UI state to the *previous* profile in memory
+        self.save_current_ui_to_memory()
+        # Load new profile
+        self.current_profile_name = new_name
+        self.load_profile(new_name)
+
+    def save_current_ui_to_memory(self):
+        # Update self.profiles[self.current_profile_name] with UI values
+        # We don't overwrite stats here, we preserve them
+        if self.current_profile_name not in self.profiles:
+            return
+
+        current_stats = self.profiles[self.current_profile_name].get('stats', {'requests': 0, 'input_tokens': 0, 'output_tokens': 0})
+        
+        # Get note configs from list widget
+        note_configs = []
+        for i in range(self.note_configs.count()):
+            item = self.note_configs.item(i)
+            note_configs.append(item.data(0x0100))
+
+        self.profiles[self.current_profile_name] = {
+            'api_key': self.api_key.text(),
+            'primary_model': self.primary_model.text(),
+            'fallback_model': self.fallback_model.text(),
+            'enable_fallback': self.enable_fallback.isChecked(),
+            'voice_name': self.voice_name.text(),
+            'temperature': self.temperature.value(),
+            'system_instruction': self.system_instruction.toPlainText(),
+            'note_type_configs': note_configs,
+            'skip_existing_audio': self.skip_existing.isChecked(),
+            'retry_attempts': self.retry_attempts.value(),
+            'retry_delay': self.retry_delay.value(),
+            'stats': current_stats
+        }
+
+    def load_profile(self, name):
+        p = self.profiles.get(name, self.get_default_profile())
+        
+        # Block signals to prevent recursion
+        self.profile_combo.blockSignals(True)
+        self.profile_combo.setCurrentText(name)
+        self.profile_combo.blockSignals(False)
+        
+        self.api_key.setText(p.get('api_key', ''))
+        self.primary_model.setText(p.get('primary_model', 'gemini-2.5-flash-tts'))
+        self.fallback_model.setText(p.get('fallback_model', 'gemini-2.5-flash-tts'))
+        self.enable_fallback.setChecked(p.get('enable_fallback', True))
+        self.voice_name.setText(p.get('voice_name', 'Zephyr'))
+        self.temperature.setValue(p.get('temperature', 1.0))
+        self.system_instruction.setText(p.get('system_instruction', ''))
+        
+        self.skip_existing.setChecked(p.get('skip_existing_audio', True))
+        self.retry_attempts.setValue(p.get('retry_attempts', 3))
+        self.retry_delay.setValue(p.get('retry_delay', 2))
+        
+        # Load Stats
+        stats = p.get('stats', {'requests': 0, 'input_tokens': 0, 'output_tokens': 0})
+        self.stat_requests.setText(str(stats.get('requests', 0)))
+        self.stat_input.setText(str(stats.get('input_tokens', 0)))
+        self.stat_output.setText(str(stats.get('output_tokens', 0)))
+        
+        # Load Note Configs
         self.note_configs.clear()
-        for cfg in self.config.get('note_type_configs', []):
+        for cfg in p.get('note_type_configs', []):
             item_text = f"{cfg['note_type']}: {cfg['source_field']} → {cfg['target_field']}"
             item = QListWidgetItem(item_text)
-            item.setData(0x0100, cfg)  # Qt.UserRole
+            item.setData(0x0100, cfg)
             self.note_configs.addItem(item)
+
+    def add_profile(self):
+        name, ok = QInputDialog.getText(self, "New Profile", "Profile Name:")
+        if ok and name:
+            if name in self.profiles:
+                showInfo("Profile already exists")
+                return
             
+            # Clone current settings for new profile
+            self.save_current_ui_to_memory()
+            new_profile = self.profiles[self.current_profile_name].copy()
+            # Reset stats for new profile
+            new_profile['stats'] = {'requests': 0, 'input_tokens': 0, 'output_tokens': 0}
+            
+            self.profiles[name] = new_profile
+            self.profile_combo.addItem(name)
+            self.on_profile_change(name)
+
+    def rename_profile(self):
+        current = self.current_profile_name
+        new_name, ok = QInputDialog.getText(self, "Rename Profile", "New Name:", text=current)
+        if ok and new_name and new_name != current:
+            if new_name in self.profiles:
+                showInfo("Profile name already taken")
+                return
+            
+            self.save_current_ui_to_memory()
+            data = self.profiles.pop(current)
+            self.profiles[new_name] = data
+            self.current_profile_name = new_name
+            
+            # Refresh combo
+            self.profile_combo.blockSignals(True)
+            self.profile_combo.clear()
+            self.profile_combo.addItems(sorted(self.profiles.keys()))
+            self.profile_combo.setCurrentText(new_name)
+            self.profile_combo.blockSignals(False)
+
+    def delete_profile(self):
+        if len(self.profiles) <= 1:
+            showInfo("Cannot delete the last profile.")
+            return
+            
+        if askUser(f"Delete profile '{self.current_profile_name}'?"):
+            del self.profiles[self.current_profile_name]
+            # Switch to first available
+            new_name = sorted(self.profiles.keys())[0]
+            self.on_profile_change(new_name)
+            
+            # Refresh combo
+            self.profile_combo.blockSignals(True)
+            self.profile_combo.clear()
+            self.profile_combo.addItems(sorted(self.profiles.keys()))
+            self.profile_combo.setCurrentText(new_name)
+            self.profile_combo.blockSignals(False)
+
+    # --- Note Config Helpers --- (Same as before)
     def add_note_config(self):
-        # Get all note types
         note_types = [m['name'] for m in mw.col.models.all()]
         if not note_types:
             showInfo("No note types found")
             return
-            
-        # For simplicity, use first note type or let user choose
-        from aqt.qt import QInputDialog
+        
         note_type, ok = QInputDialog.getItem(self, "Select Note Type",
                                              "Choose note type:", note_types, 0, False)
-        if not ok:
-            return
+        if not ok: return
             
         dialog = NoteTypeConfigDialog(self, note_type)
         if dialog.exec():
@@ -201,10 +420,7 @@ class ConfigDialog(QDialog):
             
     def edit_note_config(self):
         current = self.note_configs.currentItem()
-        if not current:
-            showInfo("Please select a mapping to edit")
-            return
-            
+        if not current: return
         cfg = current.data(0x0100)
         dialog = NoteTypeConfigDialog(self, cfg['note_type'], cfg)
         if dialog.exec():
@@ -217,23 +433,11 @@ class ConfigDialog(QDialog):
         current = self.note_configs.currentItem()
         if current:
             self.note_configs.takeItem(self.note_configs.row(current))
-            
+
     def get_config(self):
-        """Return updated configuration"""
-        note_configs = []
-        for i in range(self.note_configs.count()):
-            item = self.note_configs.item(i)
-            note_configs.append(item.data(0x0100))
-            
+        """Return the full multi-profile configuration"""
+        self.save_current_ui_to_memory()
         return {
-            'api_key': self.api_key.text(),
-            'primary_model': self.primary_model.text(),
-            'fallback_model': self.fallback_model.text(),
-            'enable_fallback': self.enable_fallback.isChecked(),
-            'voice_name': self.voice_name.text(),
-            'temperature': self.temperature.value(),
-            'note_type_configs': note_configs,
-            'skip_existing_audio': self.skip_existing.isChecked(),
-            'retry_attempts': self.retry_attempts.value(),
-            'retry_delay': self.retry_delay.value()
+            'current_profile': self.current_profile_name,
+            'profiles': self.profiles
         }

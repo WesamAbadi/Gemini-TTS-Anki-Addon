@@ -5,12 +5,12 @@ Gemini TTS Batch Addon for Anki
 import os
 import sys
 
-# --- LIBS PATH FIX (Keep this from previous step) ---
+# --- LIBS PATH FIX ---
 addon_dir = os.path.dirname(__file__)
 libs_dir = os.path.join(addon_dir, 'libs')
 if libs_dir not in sys.path:
     sys.path.insert(0, libs_dir)
-# ---------------------------------------------------
+# ---------------------
 
 from aqt import mw, gui_hooks
 from aqt.qt import QAction
@@ -19,22 +19,22 @@ from .batch_handler import BatchTTSHandler
 from .config_dialog import ConfigDialog
 
 def get_config():
-    """Helper to get config with defaults"""
+    """Helper to get config"""
     config = mw.addonManager.getConfig(__name__)
     if not config:
-        config = {
-            'api_key': '',
-            'primary_model': 'gemini-2.5-pro-preview-tts',
-            'fallback_model': 'gemini-2.5-flash-preview-tts',
-            'enable_fallback': True,
-            'voice_name': 'Zephyr',
-            'temperature': 1.0,
-            'note_type_configs': [],
-            'skip_existing_audio': True,
-            'retry_attempts': 3,
-            'retry_delay': 2
-        }
+        config = {}
     return config
+
+def get_active_api_key(config):
+    """Helper to find API key regardless of config structure (Flat vs Profiles)"""
+    if 'profiles' in config:
+        # New Profile Structure
+        current = config.get('current_profile', 'Default')
+        profile = config['profiles'].get(current, {})
+        return profile.get('api_key')
+    else:
+        # Old Flat Structure
+        return config.get('api_key')
 
 def on_open_settings():
     """Opened from Tools -> Gemini TTS Configuration"""
@@ -55,14 +55,15 @@ def on_batch_tts(browser):
         showInfo("Please select at least one note.", parent=browser)
         return
 
-    # 2. Check if API key is set before starting
+    # 2. Check if API key is set
     config = get_config()
-    if not config.get('api_key'):
+    api_key = get_active_api_key(config)
+    
+    if not api_key:
         showInfo("Please configure your API Key in 'Tools > Gemini TTS Configuration' first.", parent=browser)
         return
 
     # 3. Start processing
-    # We pass 'mw' as the main handler, but we might want to parent dialogs to browser
     handler = BatchTTSHandler(mw, selected)
     handler.start()
 
@@ -72,6 +73,7 @@ def setup_browser_menu(browser):
     action.triggered.connect(lambda: on_batch_tts(browser))
     
     # Add to the "Notes" dropdown menu in the browser
+    # We try to add it after "Add Tags" or similar, or just append
     browser.form.menu_Notes.addSeparator()
     browser.form.menu_Notes.addAction(action)
 

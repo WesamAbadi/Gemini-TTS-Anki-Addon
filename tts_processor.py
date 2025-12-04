@@ -5,7 +5,7 @@ TTS Processing using Google Gemini API
 import struct
 import time
 import mimetypes
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict
 from google import genai
 from google.genai import types
 
@@ -16,10 +16,11 @@ class RateLimitError(Exception):
 class TTSProcessor:
     """Handles TTS generation via Gemini API"""
     
-    def __init__(self, api_key: str, voice_name: str = "Zephyr", temperature: float = 1.0):
+    def __init__(self, api_key: str, voice_name: str = "Zephyr", temperature: float = 1.0, system_instruction: str = None):
         self.api_key = api_key
         self.voice_name = voice_name
         self.temperature = temperature
+        self.system_instruction = system_instruction
         self.client = None
         
     def initialize_client(self):
@@ -28,12 +29,16 @@ class TTSProcessor:
             self.client = genai.Client(api_key=self.api_key)
             
     def generate_audio(self, text: str, model: str, max_retries: int = 3, 
-                      retry_delay: int = 2) -> Optional[bytes]:
-        """Generate audio from text using specified model"""
+                      retry_delay: int = 2) -> Tuple[Optional[bytes], Dict]:
+        """
+        Generate audio and return data + usage stats
+        """
         self.initialize_client()
         
+        usage_stats = {'input_tokens': 0, 'output_tokens': 0}
+        
         if not text or not text.strip():
-            return None
+            return None, usage_stats
             
         contents = [
             types.Content(
@@ -42,6 +47,7 @@ class TTSProcessor:
             ),
         ]
         
+        # Configure the generation
         generate_content_config = types.GenerateContentConfig(
             temperature=self.temperature,
             response_modalities=["audio"],
@@ -53,25 +59,35 @@ class TTSProcessor:
                 )
             ),
         )
+
+        # Add system instruction if present
+        if self.system_instruction and self.system_instruction.strip():
+            generate_content_config.system_instruction = [
+                types.Part.from_text(text=self.system_instruction)
+            ]
         
         for attempt in range(max_retries):
             try:
                 audio_chunks = []
                 mime_type = None
                 
-                # Using the stream method as per your sample code
+                # Stream the response
                 for chunk in self.client.models.generate_content_stream(
                     model=model,
                     contents=contents,
                     config=generate_content_config,
                 ):
+                    # Capture Usage Metadata if present in chunk
+                    if hasattr(chunk, 'usage_metadata') and chunk.usage_metadata:
+                        usage_stats['input_tokens'] = chunk.usage_metadata.prompt_token_count or 0
+                        usage_stats['output_tokens'] = chunk.usage_metadata.candidates_token_count or 0
+
                     if (chunk.candidates and 
                         chunk.candidates[0].content and 
                         chunk.candidates[0].content.parts):
                         
                         part = chunk.candidates[0].content.parts[0]
                         
-                        # Logic from your sample code to handle inline data
                         if part.inline_data and part.inline_data.data:
                             audio_chunks.append(part.inline_data.data)
                             if not mime_type:
@@ -80,15 +96,15 @@ class TTSProcessor:
                 if audio_chunks:
                     audio_data = b''.join(audio_chunks)
                     
-                    # Convert to WAV if needed or if extension detection fails
+                    # Convert to WAV if needed
                     ext = mimetypes.guess_extension(mime_type) if mime_type else None
                     if ext is None or 'wav' not in str(ext).lower():
-                        return self.convert_to_wav(audio_data, mime_type or "audio/wav")
+                        final_audio = self.convert_to_wav(audio_data, mime_type or "audio/wav")
+                        return final_audio, usage_stats
                     
-                    # If it is already wav (unlikely with this API usually returns raw PCM or similar), return
-                    return audio_data
+                    return audio_data, usage_stats
                     
-                return None
+                return None, usage_stats
                 
             except Exception as e:
                 error_msg = str(e).lower()
@@ -102,7 +118,7 @@ class TTSProcessor:
                         
                 raise Exception(f"TTS generation failed: {e}")
                 
-        return None
+        return None, usage_stats
         
     def convert_to_wav(self, audio_data: bytes, mime_type: str) -> bytes:
         """Convert raw audio data to WAV format"""
@@ -161,25 +177,27 @@ class TTSProcessor:
         
     def generate_with_fallback(self, text: str, primary_model: str, 
                                fallback_model: str, enable_fallback: bool,
-                               max_retries: int = 3, retry_delay: int = 2) -> Tuple[Optional[bytes], str]:
-        """Generate audio with automatic fallback on rate limit"""
+                               max_retries: int = 3, retry_delay: int = 2) -> Tuple[Optional[bytes], str, Dict]:
+        """
+        Generate audio with automatic fallback. Returns (audio, model_name, usage_stats)
+        """
         try:
-            audio = self.generate_audio(text, primary_model, max_retries, retry_delay)
+            audio, stats = self.generate_audio(text, primary_model, max_retries, retry_delay)
             if audio:
-                return audio, primary_model
-            return None, "No audio generated"
+                return audio, primary_model, stats
+            return None, "No audio generated", stats
             
         except RateLimitError as e:
             if enable_fallback:
                 try:
-                    audio = self.generate_audio(text, fallback_model, max_retries, retry_delay)
+                    audio, stats = self.generate_audio(text, fallback_model, max_retries, retry_delay)
                     if audio:
-                        return audio, fallback_model
-                    return None, "Fallback model: No audio generated"
+                        return audio, fallback_model, stats
+                    return None, "Fallback model: No audio generated", stats
                 except Exception as fallback_error:
-                    return None, f"Fallback failed: {fallback_error}"
+                    return None, f"Fallback failed: {fallback_error}", {}
             else:
-                return None, str(e)
+                return None, str(e), {}
                 
         except Exception as e:
-            return None, str(e)
+            return None, str(e), {}
