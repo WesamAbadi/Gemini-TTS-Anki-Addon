@@ -1,9 +1,10 @@
 import time
 import re
 import threading
+import json
 from collections import defaultdict
 from typing import List, Dict
-from aqt.qt import QDialog, QVBoxLayout, QProgressBar, QLabel, QPushButton, QTextEdit, QThread, pyqtSignal, Qt
+from aqt.qt import QDialog, QVBoxLayout, QProgressBar, QLabel, QPushButton, QTextEdit, QThread, pyqtSignal, Qt, QFont
 from aqt import mw
 from .config_dialog import ConfigDialog
 from .tts_processor import TTSProcessor
@@ -19,31 +20,42 @@ class ProgressDialog(QDialog):
         
     def setup_ui(self, total_notes: int):
         self.setWindowTitle("Processing Gemini TTS")
-        self.setMinimumWidth(600)
+        self.setMinimumWidth(700)
+        self.setMinimumHeight(550)
         self.setWindowModality(Qt.WindowModality.ApplicationModal)
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowType.WindowContextHelpButtonHint)
         
         layout = QVBoxLayout()
+        
+        # Status Label
         self.status_label = QLabel("Initializing...")
+        self.status_label.setStyleSheet("font-weight: bold; font-size: 14px;")
         layout.addWidget(self.status_label)
         
+        # Progress Bar
         self.progress_bar = QProgressBar()
         self.progress_bar.setMaximum(total_notes)
         self.progress_bar.setValue(0)
         self.progress_bar.setTextVisible(True)
-        self.progress_bar.setFormat("%v / %m Notes") 
+        self.progress_bar.setFormat("%v / %m Notes")
+        self.progress_bar.setStyleSheet("QProgressBar { height: 20px; }")
         layout.addWidget(self.progress_bar)
         
-        # Updated Stats Label to include Skipped
+        # Stats
         self.stats_label = QLabel("Fields Generated: 0 | Skipped: 0 | Failed: 0")
         layout.addWidget(self.stats_label)
         
         self.usage_label = QLabel("Session Usage - Input: 0 | Output: 0")
+        self.usage_label.setStyleSheet("color: #666;")
         layout.addWidget(self.usage_label)
         
+        # Log Box
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
-        self.log_text.setMaximumHeight(300)
+        font = QFont("Consolas", 10)
+        font.setStyleHint(QFont.StyleHint.Monospace)
+        self.log_text.setFont(font)
+        # self.log_text.setStyleSheet("QTextEdit { background-color: #f5f5f5; border: 1px solid #ccc; }")
         layout.addWidget(self.log_text)
         
         self.cancel_btn = QPushButton("Cancel")
@@ -59,8 +71,8 @@ class ProgressDialog(QDialog):
     def update_usage(self, input_tokens, output_tokens):
         self.usage_label.setText(f"Session Usage - Input: {input_tokens} | Output: {output_tokens}")
         
-    def add_log(self, message: str):
-        self.log_text.append(message)
+    def add_log_html(self, html_msg: str):
+        self.log_text.append(html_msg)
         sb = self.log_text.verticalScrollBar()
         sb.setValue(sb.maximum())
 
@@ -75,10 +87,9 @@ class ProgressDialog(QDialog):
 class TTSWorker(QThread):
     """Background worker thread"""
     
-    # note_idx, status_text, success_ops, failed_ops, skipped_ops
     progress_update = pyqtSignal(int, str, int, int, int)
     usage_update = pyqtSignal(int, int)
-    log_update = pyqtSignal(str)
+    log_html_update = pyqtSignal(str) 
     finished_signal = pyqtSignal(str, dict)
     
     def __init__(self, note_ids, config, processor):
@@ -88,13 +99,11 @@ class TTSWorker(QThread):
         self.processor = processor
         self.is_cancelled = False
         
-        # Organize configs: { 'Note Type Name': [ {cfg1}, {cfg2} ] }
         self.note_type_map = defaultdict(list)
         for cfg in config['note_type_configs']:
-            if cfg.get('enabled', True): # Only add enabled configs
+            if cfg.get('enabled', True):
                 self.note_type_map[cfg['note_type']].append(cfg)
         
-        # Session Stats
         self.total_input_tokens = 0
         self.total_output_tokens = 0
         self.total_requests = 0
@@ -116,26 +125,86 @@ class TTSWorker(QThread):
             raise container['error']
         return container['result']
 
+    def _format_duration(self, seconds: float) -> str:
+        if seconds < 1: return f"{int(seconds*1000)}ms"
+        if seconds < 60: return f"{seconds:.1f}s"
+        
+        minutes = int(seconds // 60)
+        rem_sec = int(seconds % 60)
+        if minutes < 60: return f"{minutes}m {rem_sec}s"
+        
+        hours = int(minutes // 60)
+        rem_min = int(minutes % 60)
+        return f"{hours}h {rem_min}m"
+
+    def _format_error(self, error_str: str) -> str:
+        """Parses Google GenAI errors into clean HTML"""
+        error_str = str(error_str)
+        
+        # Check for 429 / Resource Exhausted
+        if '429' in error_str or 'RESOURCE_EXHAUSTED' in error_str:
+            # Extract Wait Time
+            wait_msg = "Unknown"
+            match_wait = re.search(r"retry in\s*([\d\.]+)(s|ms)", error_str)
+            if match_wait:
+                val = float(match_wait.group(1))
+                unit = match_wait.group(2)
+                if unit == 'ms': val /= 1000
+                wait_msg = self._format_duration(val)
+            
+            # Extract Limit info
+            limit_msg = ""
+            match_limit = re.search(r"limit:\s*(\d+)", error_str)
+            if match_limit:
+                limit_msg = f" (Limit: {match_limit.group(1)})"
+
+            # Determine Quota Type
+            quota_type = "Rate Limit"
+            if "PerDay" in error_str:
+                quota_type = "Daily Quota"
+            elif "PerMinute" in error_str:
+                quota_type = "Minute Quota"
+
+            return f"<b>{quota_type} Hit</b>{limit_msg}. Waiting <b>{wait_msg}</b>..."
+
+        # Server Errors
+        if '500' in error_str or '503' in error_str:
+            return "<b>Server Error:</b> Google internal error. Retrying..."
+
+        # JSON Message Extraction
+        try:
+            if '{' in error_str and '}' in error_str:
+                match_msg = re.search(r"'message':\s*'([^']*)'", error_str)
+                if match_msg:
+                    return f"API Error: {match_msg.group(1)}"
+        except: pass
+
+        if len(error_str) > 150:
+            return f"Error: {error_str[:150]}..."
+        return f"Error: {error_str}"
+
     def run(self):
         success_ops = 0
         failed_ops = 0
         skipped_ops = 0
         consecutive_errors = 0
         
-        total_notes = len(self.note_ids)
         request_wait = self.config.get('request_wait', 0.5)
         tag_on_success = self.config.get('tag_on_success', '')
+        verbose = self.config.get('verbose_logging', False)
+        retry_empty = self.config.get('retry_on_empty', False)
+
+        check_cancel = lambda: self.is_cancelled
 
         for idx, note_id in enumerate(self.note_ids):
             if self.is_cancelled:
-                self.log_update.emit("Processing cancelled by user.")
+                self.log_html_update.emit("<span style='color:orange'>Processing cancelled by user.</span>")
                 break
                 
             if consecutive_errors >= 5:
-                self.log_update.emit("Aborting: Too many consecutive errors.")
+                self.log_html_update.emit("<span style='color:red; font-weight:bold'>Aborting: 5 consecutive errors.</span>")
                 break
 
-            # --- 1. Get Note and identify Model ---
             def get_note_basic():
                 try:
                     note = mw.col.get_note(note_id)
@@ -148,68 +217,70 @@ class TTSWorker(QThread):
                 note_obj = None
 
             if not note_obj:
-                self.log_update.emit(f"Note {note_id}: Skipped (Deleted/Error)")
+                if verbose: self.log_html_update.emit(f"<span style='color:gray'>Note {note_id}: Skipped (Deleted/Error)</span>")
                 continue
 
-            # Check if we have configs for this model
             if model_name not in self.note_type_map:
-                # Log only if verbose, otherwise silent skip implies no config
                 continue
 
             configs = self.note_type_map[model_name]
-            note_success = False
 
-            # --- 2. Iterate through all mappings for this note ---
             for map_cfg in configs:
                 if self.is_cancelled: break
 
                 src = map_cfg['source_field']
                 tgt = map_cfg['target_field']
 
-                # Read fields
                 if src not in note_obj:
-                    self.log_update.emit(f"Note {note_id}: Field '{src}' missing")
+                    self.log_html_update.emit(f"<span style='color:red'>Note {note_id}: Field '{src}' missing</span>")
                     failed_ops += 1
                     continue
 
                 text = note_obj[src]
                 
-                # Check existing
                 if self.config.get('skip_existing_audio', True):
                     if tgt in note_obj and '[sound:' in note_obj[tgt]:
-                        self.log_update.emit(f"Note {note_id} ({src}): Skipped (Audio exists)")
                         skipped_ops += 1
+                        if verbose:
+                            self.log_html_update.emit(f"<span style='color:gray'>Note {note_id} ({src}): Skipped (Audio exists)</span>")
                         self.progress_update.emit(idx + 1, "Skipping...", success_ops, failed_ops, skipped_ops)
+                        time.sleep(0.01) 
                         continue
 
-                # Clean Text
                 clean_text = re.sub(r'<[^>]+>', '', text)
                 clean_text = re.sub(r'\s+', ' ', clean_text).strip()
 
                 if not clean_text:
-                    self.log_update.emit(f"Note {note_id} ({src}): Skipped (Empty text)")
+                    if verbose: self.log_html_update.emit(f"<span style='color:gray'>Note {note_id} ({src}): Skipped (Empty text)</span>")
                     skipped_ops += 1
+                    time.sleep(0.01)
                     continue
 
-                # Apply delay before request
                 if request_wait > 0:
-                    time.sleep(request_wait)
+                    for _ in range(int(request_wait * 10)):
+                        if self.is_cancelled: break
+                        time.sleep(0.1)
 
-                # --- 3. Generate Audio ---
+                if self.is_cancelled: break
+
                 self.progress_update.emit(idx + 1, f"Generating {src}...", success_ops, failed_ops, skipped_ops)
                 
                 audio_data = None
                 model_info = ""
                 stats = {}
+                error_msg = ""
 
                 try:
+                    # processor catches its own exceptions and returns error string in model_info
                     audio_data, model_info, stats = self.processor.generate_with_fallback(
                         clean_text,
                         self.config['primary_model'],
                         self.config['fallback_model'],
                         self.config.get('enable_fallback', True),
                         self.config.get('retry_attempts', 3),
-                        self.config.get('retry_delay', 2)
+                        self.config.get('retry_delay', 2),
+                        retry_empty,
+                        check_cancel
                     )
                     
                     if stats:
@@ -220,20 +291,19 @@ class TTSWorker(QThread):
                         self.usage_update.emit(self.total_input_tokens, self.total_output_tokens)
                 
                 except Exception as e:
-                    model_info = str(e)
+                    # This only catches unexpected crashes in the wrapper logic
+                    error_msg = self._format_error(str(e))
+                    model_info = error_msg
 
-                # --- 4. Save Audio ---
                 if audio_data:
-                    consecutive_errors = 0 # Reset error counter
-                    
+                    consecutive_errors = 0
                     def save_result(nid=note_id, t_field=tgt, data=audio_data, tag=tag_on_success):
-                        filename = f"gemini_tts_{nid}_{int(time.time()*1000)}.wav" # added millis to avoid collision
+                        filename = f"gemini_tts_{nid}_{int(time.time()*1000)}.wav"
                         mw.col.media.write_data(filename, data)
                         try:
                             n = mw.col.get_note(nid)
                             n[t_field] = f"[sound:{filename}]"
-                            if tag:
-                                n.add_tag(tag)
+                            if tag: n.add_tag(tag)
                             mw.col.update_note(n)
                             return True, filename
                         except: return False, "Note deleted"
@@ -242,24 +312,35 @@ class TTSWorker(QThread):
                         success, msg = self._run_on_main_sync(save_result)
                         if success:
                             success_ops += 1
-                            note_success = True
-                            self.log_update.emit(f"Note {note_id} ({src}): Success")
+                            self.log_html_update.emit(f"Note {note_id} ({src}): <span style='color:green; font-weight:bold'>Success</span>")
                         else:
                             failed_ops += 1
-                            self.log_update.emit(f"Note {note_id} ({src}): Save Error - {msg}")
+                            self.log_html_update.emit(f"<span style='color:red'>Note {note_id} ({src}): Save Error - {msg}</span>")
                     except Exception as e:
                         failed_ops += 1
-                        self.log_update.emit(f"Note {note_id}: Save Future Error - {str(e)}")
+                        self.log_html_update.emit(f"<span style='color:red'>Note {note_id}: Save Future Error - {str(e)}</span>")
                 else:
                     consecutive_errors += 1
                     failed_ops += 1
-                    self.log_update.emit(f"Note {note_id} ({src}): API Error - {model_info}")
+                    
+                    # FIX: Format the returned error message if it wasn't caught by the except block
+                    if not error_msg and model_info:
+                        # The processor returns the raw error string in model_info
+                        display_err = self._format_error(model_info)
+                    elif error_msg:
+                        display_err = error_msg
+                    else:
+                        display_err = "Unknown API Error"
+                        
+                    self.log_html_update.emit(f"Note {note_id} ({src}): <span style='color:red'>{display_err}</span>")
 
-            # End of Note Loop
             self.progress_update.emit(idx + 1, "Waiting...", success_ops, failed_ops, skipped_ops)
 
-        summary = f"\nProcessing Complete!\nSuccess (Fields): {success_ops}\nSkipped: {skipped_ops}\nFailed: {failed_ops}\n"
-        summary += f"Session Tokens: Input {self.total_input_tokens}, Output {self.total_output_tokens}"
+        summary = f"<br><b>Processing Complete!</b><br>"
+        summary += f"<span style='color:green'>Success (Fields): {success_ops}</span><br>"
+        summary += f"<span style='color:gray'>Skipped: {skipped_ops}</span><br>"
+        summary += f"<span style='color:red'>Failed: {failed_ops}</span><br>"
+        summary += f"<i>Session Tokens: Input {self.total_input_tokens}, Output {self.total_output_tokens}</i>"
         
         final_stats = {
             'requests': self.total_requests,
@@ -296,7 +377,9 @@ class BatchTTSHandler:
             'enable_fallback': True,
             'voice_name': 'Zephyr',
             'temperature': 1.0,
-            'request_wait': 0.5, # Default delay
+            'request_wait': 0.5,
+            'retry_on_empty': False,
+            'verbose_logging': False,
             'tag_on_success': '',
             'note_type_configs': [],
             'stats': {'requests': 0, 'input_tokens': 0, 'output_tokens': 0}
@@ -328,7 +411,7 @@ class BatchTTSHandler:
         self.worker = TTSWorker(self.note_ids, self.active_config, processor)
         self.worker.progress_update.connect(self.dialog.update_progress)
         self.worker.usage_update.connect(self.dialog.update_usage)
-        self.worker.log_update.connect(self.dialog.add_log)
+        self.worker.log_html_update.connect(self.dialog.add_log_html)
         self.worker.finished_signal.connect(self.on_finished)
         self.worker.start()
         
@@ -339,7 +422,7 @@ class BatchTTSHandler:
             self.dialog.status_label.setText("Cancelling...")
             
     def on_finished(self, summary, session_stats):
-        self.dialog.add_log(summary)
+        self.dialog.add_log_html(summary)
         self.dialog.status_label.setText("Done")
         self.dialog.progress_bar.setValue(len(self.note_ids))
         

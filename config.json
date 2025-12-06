@@ -7,6 +7,8 @@
     "temperature": 1.0,
     "request_wait": 0.5,
     "tag_on_success": "",
+    "retry_on_empty": false,
+    "verbose_logging": false,
     "note_type_configs": [],
     "skip_existing_audio": true,
     "retry_attempts": 3,

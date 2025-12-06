@@ -1,16 +1,14 @@
-"""
-TTS Processing using Google Gemini API
-"""
-
 import struct
 import time
 import mimetypes
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, Callable
 from google import genai
 from google.genai import types
 
 class RateLimitError(Exception):
-    """Raised when API rate limit is hit"""
+    pass
+
+class EmptyResponseError(Exception):
     pass
 
 class TTSProcessor:
@@ -29,23 +27,19 @@ class TTSProcessor:
             self.client = genai.Client(api_key=self.api_key)
             
     def generate_audio(self, text: str, model: str, max_retries: int = 3, 
-                      retry_delay: int = 2) -> Tuple[Optional[bytes], Dict]:
+                      retry_delay: int = 2, retry_on_empty: bool = False,
+                      check_cancel: Callable[[], bool] = None) -> Tuple[Optional[bytes], Dict]:
         """
         Generate audio and return data + usage stats
         """
         self.initialize_client()
-        
         usage_stats = {'input_tokens': 0, 'output_tokens': 0}
         
         if not text or not text.strip():
             return None, usage_stats
 
-        # --- FIX: Combine instruction with text instead of using config.system_instruction ---
-        # The API currently returns 500 if system_instruction is passed in config for Audio
         final_text = text
         if self.system_instruction and self.system_instruction.strip():
-            # We combine them. Example: "Speak cheerfully: Hello world"
-            # We add a newline to separate instruction from content clearly
             final_text = f"{self.system_instruction.strip()}\n{text}"
 
         contents = [
@@ -55,7 +49,6 @@ class TTSProcessor:
             ),
         ]
         
-        # Configure the generation
         generate_content_config = types.GenerateContentConfig(
             temperature=self.temperature,
             response_modalities=["audio"],
@@ -66,21 +59,25 @@ class TTSProcessor:
                     )
                 )
             ),
-            # system_instruction field removed to prevent 500 error
         )
         
         for attempt in range(max_retries):
+            if check_cancel and check_cancel():
+                return None, usage_stats
+
             try:
                 audio_chunks = []
                 mime_type = None
                 
-                # Stream the response
+                # We can't interrupt the generator easily once it starts, but it yields chunks
                 for chunk in self.client.models.generate_content_stream(
                     model=model,
                     contents=contents,
                     config=generate_content_config,
                 ):
-                    # Capture Usage Metadata if present in chunk
+                    if check_cancel and check_cancel():
+                        return None, usage_stats
+
                     if hasattr(chunk, 'usage_metadata') and chunk.usage_metadata:
                         usage_stats['input_tokens'] = chunk.usage_metadata.prompt_token_count or 0
                         usage_stats['output_tokens'] = chunk.usage_metadata.candidates_token_count or 0
@@ -98,28 +95,48 @@ class TTSProcessor:
                                 
                 if audio_chunks:
                     audio_data = b''.join(audio_chunks)
-                    
-                    # Convert to WAV if needed
                     ext = mimetypes.guess_extension(mime_type) if mime_type else None
                     if ext is None or 'wav' not in str(ext).lower():
                         final_audio = self.convert_to_wav(audio_data, mime_type or "audio/wav")
                         return final_audio, usage_stats
-                    
                     return audio_data, usage_stats
-                    
+                
+                if retry_on_empty:
+                    raise EmptyResponseError("Received empty audio stream from API.")
+                
                 return None, usage_stats
                 
             except Exception as e:
+                # Immediate exit if cancelled
+                if check_cancel and check_cancel():
+                    return None, usage_stats
+
                 error_msg = str(e).lower()
-                if '429' in error_msg or 'rate limit' in error_msg or 'quota' in error_msg:
-                    raise RateLimitError(f"Rate limit hit: {e}")
                 
-                if '500' in error_msg or '503' in error_msg or 'timeout' in error_msg:
+                if '429' in error_msg or 'resource_exhausted' in error_msg:
+                    raise RateLimitError(str(e))
+                
+                is_retryable = (
+                    '500' in error_msg or 
+                    '503' in error_msg or 
+                    'timeout' in error_msg or 
+                    isinstance(e, EmptyResponseError)
+                )
+
+                if is_retryable:
                     if attempt < max_retries - 1:
-                        time.sleep(retry_delay * (attempt + 1))
+                        # Interruptible sleep
+                        wait_sec = retry_delay * (attempt + 1)
+                        for _ in range(wait_sec * 10):
+                            if check_cancel and check_cancel():
+                                return None, usage_stats
+                            time.sleep(0.1)
                         continue
-                        
-                raise Exception(f"TTS generation failed: {e}")
+                
+                if isinstance(e, EmptyResponseError):
+                    return None, usage_stats
+
+                raise Exception(f"{e}")
                 
         return None, usage_stats
         
@@ -154,7 +171,6 @@ class TTSProcessor:
         return header + audio_data
         
     def parse_audio_mime_type(self, mime_type: str) -> dict:
-        """Parse bits per sample and rate from audio MIME type"""
         bits_per_sample = 16
         rate = 24000
 
@@ -180,12 +196,14 @@ class TTSProcessor:
         
     def generate_with_fallback(self, text: str, primary_model: str, 
                                fallback_model: str, enable_fallback: bool,
-                               max_retries: int = 3, retry_delay: int = 2) -> Tuple[Optional[bytes], str, Dict]:
+                               max_retries: int = 3, retry_delay: int = 2,
+                               retry_on_empty: bool = False,
+                               check_cancel: Callable[[], bool] = None) -> Tuple[Optional[bytes], str, Dict]:
         """
         Generate audio with automatic fallback. Returns (audio, model_name, usage_stats)
         """
         try:
-            audio, stats = self.generate_audio(text, primary_model, max_retries, retry_delay)
+            audio, stats = self.generate_audio(text, primary_model, max_retries, retry_delay, retry_on_empty, check_cancel)
             if audio:
                 return audio, primary_model, stats
             return None, "No audio generated", stats
@@ -193,12 +211,16 @@ class TTSProcessor:
         except RateLimitError as e:
             if enable_fallback:
                 try:
-                    audio, stats = self.generate_audio(text, fallback_model, max_retries, retry_delay)
+                    # Brief wait before fallback
+                    if check_cancel and not check_cancel():
+                        time.sleep(1)
+                    
+                    audio, stats = self.generate_audio(text, fallback_model, max_retries, retry_delay, retry_on_empty, check_cancel)
                     if audio:
                         return audio, fallback_model, stats
                     return None, "Fallback model: No audio generated", stats
                 except Exception as fallback_error:
-                    return None, f"Fallback failed: {fallback_error}", {}
+                    return None, str(fallback_error), {}
             else:
                 return None, str(e), {}
                 

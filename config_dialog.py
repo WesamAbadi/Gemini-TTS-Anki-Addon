@@ -1,7 +1,7 @@
 from aqt.qt import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
                      QPushButton, QComboBox, QCheckBox, QGroupBox, QFormLayout,
                      QListWidget, QListWidgetItem, QDialogButtonBox, QSpinBox,
-                     QDoubleSpinBox, QTabWidget, QWidget, QTextEdit, QMessageBox, QInputDialog)
+                     QDoubleSpinBox, QTabWidget, QWidget, QTextEdit, QMessageBox, QInputDialog, Qt)
 from aqt.utils import showInfo, askUser
 from aqt import mw
 
@@ -18,7 +18,6 @@ class NoteTypeConfigDialog(QDialog):
         self.setWindowTitle(f"Configure: {self.note_type_name}")
         layout = QVBoxLayout()
         
-        # Get fields
         model = mw.col.models.by_name(self.note_type_name)
         if not model:
             showInfo(f"Note type '{self.note_type_name}' not found")
@@ -27,39 +26,32 @@ class NoteTypeConfigDialog(QDialog):
             
         fields = [f['name'] for f in model['flds']]
         
-        # Enable Checkbox
         self.enabled_chk = QCheckBox("Enable this mapping")
         self.enabled_chk.setChecked(self.config.get('enabled', True))
         layout.addWidget(self.enabled_chk)
         
-        # Source field
         form = QFormLayout()
         self.source_field = QComboBox()
         self.source_field.addItems(fields)
         if self.config.get('source_field'):
             idx = self.source_field.findText(self.config['source_field'])
-            if idx >= 0:
-                self.source_field.setCurrentIndex(idx)
+            if idx >= 0: self.source_field.setCurrentIndex(idx)
         form.addRow("Source Text Field:", self.source_field)
         
-        # Target field
         self.target_field = QComboBox()
         self.target_field.addItems(fields)
         if self.config.get('target_field'):
             idx = self.target_field.findText(self.config['target_field'])
-            if idx >= 0:
-                self.target_field.setCurrentIndex(idx)
+            if idx >= 0: self.target_field.setCurrentIndex(idx)
         form.addRow("Target Audio Field:", self.target_field)
         
         layout.addLayout(form)
         
-        # Buttons
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | 
                                    QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
-        
         self.setLayout(layout)
         
     def get_config(self):
@@ -109,6 +101,8 @@ class ConfigDialog(QDialog):
             'retry_delay': 2,
             'request_wait': 0.5,
             'tag_on_success': '',
+            'retry_on_empty': False,
+            'verbose_logging': False,
             'stats': {'requests': 0, 'input_tokens': 0, 'output_tokens': 0}
         }
         
@@ -119,35 +113,29 @@ class ConfigDialog(QDialog):
         
         main_layout = QVBoxLayout()
         
-        # --- Profile Management Section ---
+        # Profile Group
         profile_group = QGroupBox("Profiles")
         profile_layout = QHBoxLayout()
-        
         self.profile_combo = QComboBox()
         self.profile_combo.addItems(sorted(self.profiles.keys()))
         self.profile_combo.setCurrentText(self.current_profile_name)
         self.profile_combo.currentTextChanged.connect(self.on_profile_change)
-        
         add_btn = QPushButton("+")
         add_btn.setFixedWidth(30)
         add_btn.clicked.connect(self.add_profile)
-        
         rename_btn = QPushButton("Rename")
         rename_btn.clicked.connect(self.rename_profile)
-        
         del_btn = QPushButton("Delete")
         del_btn.clicked.connect(self.delete_profile)
-        
         profile_layout.addWidget(QLabel("Current Profile:"))
         profile_layout.addWidget(self.profile_combo, 1)
         profile_layout.addWidget(add_btn)
         profile_layout.addWidget(rename_btn)
         profile_layout.addWidget(del_btn)
-        
         profile_group.setLayout(profile_layout)
         main_layout.addWidget(profile_group)
 
-        # --- Tabs ---
+        # Tabs
         self.tabs = QTabWidget()
         
         self.tab_api = QWidget()
@@ -160,7 +148,7 @@ class ConfigDialog(QDialog):
         
         self.tab_proc = QWidget()
         self.setup_proc_tab()
-        self.tabs.addTab(self.tab_proc, "Processing & Stats")
+        self.tabs.addTab(self.tab_proc, "Settings & Stats")
         
         main_layout.addWidget(self.tabs)
         
@@ -169,7 +157,6 @@ class ConfigDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         main_layout.addWidget(buttons)
-        
         self.setLayout(main_layout)
 
     def setup_api_tab(self):
@@ -177,7 +164,7 @@ class ConfigDialog(QDialog):
         form = QFormLayout()
         
         self.api_key = QLineEdit()
-        self.api_key.setEchoMode(QLineEdit.EchoMode.Normal) # Changed from Password
+        self.api_key.setEchoMode(QLineEdit.EchoMode.Normal)
         self.api_key.setPlaceholderText("Enter your Gemini API Key")
         form.addRow("Gemini API Key:", self.api_key)
         
@@ -202,16 +189,14 @@ class ConfigDialog(QDialog):
         
         layout.addWidget(QLabel("System Instructions (Optional):"))
         self.system_instruction = QTextEdit()
-        self.system_instruction.setPlaceholderText("E.g., Speak slowly and clearly.")
+        self.system_instruction.setPlaceholderText("E.g., Speak slowly.")
         self.system_instruction.setMaximumHeight(80)
         layout.addWidget(self.system_instruction)
-        
         layout.addStretch()
         self.tab_api.setLayout(layout)
 
     def setup_notes_tab(self):
         layout = QVBoxLayout()
-        
         self.note_configs = QListWidget()
         layout.addWidget(self.note_configs)
         
@@ -227,7 +212,6 @@ class ConfigDialog(QDialog):
         btn_layout.addWidget(edit_btn)
         btn_layout.addWidget(remove_btn)
         layout.addLayout(btn_layout)
-        
         self.tab_notes.setLayout(layout)
 
     def setup_proc_tab(self):
@@ -238,6 +222,13 @@ class ConfigDialog(QDialog):
         
         self.skip_existing = QCheckBox("Skip notes with existing audio")
         form.addRow("", self.skip_existing)
+        
+        self.verbose_logging = QCheckBox("Show 'Skipped' messages in Log")
+        form.addRow("", self.verbose_logging)
+
+        self.retry_on_empty = QCheckBox("Retry on 'No audio generated' error")
+        self.retry_on_empty.setToolTip("If checked, empty responses are treated as temporary failures and retried.")
+        form.addRow("", self.retry_on_empty)
         
         self.request_wait = QDoubleSpinBox()
         self.request_wait.setRange(0.0, 10.0)
@@ -283,7 +274,6 @@ class ConfigDialog(QDialog):
 
     def save_current_ui_to_memory(self):
         if self.current_profile_name not in self.profiles: return
-
         current_stats = self.profiles[self.current_profile_name].get('stats', {'requests': 0, 'input_tokens': 0, 'output_tokens': 0})
         
         note_configs = []
@@ -305,12 +295,13 @@ class ConfigDialog(QDialog):
             'retry_delay': self.retry_delay.value(),
             'request_wait': self.request_wait.value(),
             'tag_on_success': self.tag_on_success.text(),
+            'retry_on_empty': self.retry_on_empty.isChecked(),
+            'verbose_logging': self.verbose_logging.isChecked(),
             'stats': current_stats
         }
 
     def load_profile(self, name):
         p = self.profiles.get(name, self.get_default_profile())
-        
         self.profile_combo.blockSignals(True)
         self.profile_combo.setCurrentText(name)
         self.profile_combo.blockSignals(False)
@@ -328,6 +319,8 @@ class ConfigDialog(QDialog):
         self.retry_delay.setValue(p.get('retry_delay', 2))
         self.request_wait.setValue(p.get('request_wait', 0.5))
         self.tag_on_success.setText(p.get('tag_on_success', ''))
+        self.retry_on_empty.setChecked(p.get('retry_on_empty', False))
+        self.verbose_logging.setChecked(p.get('verbose_logging', False))
         
         stats = p.get('stats', {'requests': 0, 'input_tokens': 0, 'output_tokens': 0})
         self.stat_requests.setText(str(stats.get('requests', 0)))
@@ -351,7 +344,7 @@ class ConfigDialog(QDialog):
         name, ok = QInputDialog.getText(self, "New Profile", "Profile Name:")
         if ok and name:
             if name in self.profiles:
-                showInfo("Profile already exists")
+                showInfo("Exists")
                 return
             self.save_current_ui_to_memory()
             new_profile = self.profiles[self.current_profile_name].copy()
@@ -364,9 +357,7 @@ class ConfigDialog(QDialog):
         current = self.current_profile_name
         new_name, ok = QInputDialog.getText(self, "Rename Profile", "New Name:", text=current)
         if ok and new_name and new_name != current:
-            if new_name in self.profiles:
-                showInfo("Name taken")
-                return
+            if new_name in self.profiles: return
             self.save_current_ui_to_memory()
             data = self.profiles.pop(current)
             self.profiles[new_name] = data
@@ -378,9 +369,7 @@ class ConfigDialog(QDialog):
             self.profile_combo.blockSignals(False)
 
     def delete_profile(self):
-        if len(self.profiles) <= 1:
-            showInfo("Cannot delete last profile")
-            return
+        if len(self.profiles) <= 1: return
         if askUser(f"Delete '{self.current_profile_name}'?"):
             del self.profiles[self.current_profile_name]
             new_name = sorted(self.profiles.keys())[0]
@@ -414,13 +403,12 @@ class ConfigDialog(QDialog):
             if not new_cfg.get('enabled', True):
                 current.setForeground(Qt.GlobalColor.gray)
             else:
-                current.setForeground(Qt.GlobalColor.black) # Reset color
+                current.setForeground(Qt.GlobalColor.black)
             current.setData(0x0100, new_cfg)
             
     def remove_note_config(self):
         current = self.note_configs.currentItem()
-        if current:
-            self.note_configs.takeItem(self.note_configs.row(current))
+        if current: self.note_configs.takeItem(self.note_configs.row(current))
 
     def get_config(self):
         self.save_current_ui_to_memory()
