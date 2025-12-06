@@ -1,7 +1,3 @@
-"""
-Configuration Dialog for Gemini TTS Addon
-"""
-
 from aqt.qt import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
                      QPushButton, QComboBox, QCheckBox, QGroupBox, QFormLayout,
                      QListWidget, QListWidgetItem, QDialogButtonBox, QSpinBox,
@@ -22,7 +18,7 @@ class NoteTypeConfigDialog(QDialog):
         self.setWindowTitle(f"Configure: {self.note_type_name}")
         layout = QVBoxLayout()
         
-        # Get fields for this note type
+        # Get fields
         model = mw.col.models.by_name(self.note_type_name)
         if not model:
             showInfo(f"Note type '{self.note_type_name}' not found")
@@ -30,6 +26,11 @@ class NoteTypeConfigDialog(QDialog):
             return
             
         fields = [f['name'] for f in model['flds']]
+        
+        # Enable Checkbox
+        self.enabled_chk = QCheckBox("Enable this mapping")
+        self.enabled_chk.setChecked(self.config.get('enabled', True))
+        layout.addWidget(self.enabled_chk)
         
         # Source field
         form = QFormLayout()
@@ -65,7 +66,8 @@ class NoteTypeConfigDialog(QDialog):
         return {
             'note_type': self.note_type_name,
             'source_field': self.source_field.currentText(),
-            'target_field': self.target_field.currentText()
+            'target_field': self.target_field.currentText(),
+            'enabled': self.enabled_chk.isChecked()
         }
 
 
@@ -76,7 +78,6 @@ class ConfigDialog(QDialog):
         super().__init__(parent)
         self.global_config = global_config
         
-        # Ensure profiles exist in structure
         if 'profiles' not in self.global_config:
             self.global_config = {
                 'current_profile': 'Default',
@@ -86,7 +87,6 @@ class ConfigDialog(QDialog):
         self.current_profile_name = self.global_config.get('current_profile', 'Default')
         self.profiles = self.global_config.get('profiles', {})
         
-        # Ensure Default profile exists
         if not self.profiles:
             self.profiles['Default'] = self.get_default_profile()
             self.current_profile_name = 'Default'
@@ -107,13 +107,15 @@ class ConfigDialog(QDialog):
             'skip_existing_audio': True,
             'retry_attempts': 3,
             'retry_delay': 2,
+            'request_wait': 0.5,
+            'tag_on_success': '',
             'stats': {'requests': 0, 'input_tokens': 0, 'output_tokens': 0}
         }
         
     def setup_ui(self):
         self.setWindowTitle("Gemini TTS Configuration")
         self.setMinimumWidth(600)
-        self.setMinimumHeight(500)
+        self.setMinimumHeight(550)
         
         main_layout = QVBoxLayout()
         
@@ -145,27 +147,23 @@ class ConfigDialog(QDialog):
         profile_group.setLayout(profile_layout)
         main_layout.addWidget(profile_group)
 
-        # --- Tabs for Settings ---
+        # --- Tabs ---
         self.tabs = QTabWidget()
         
-        # Tab 1: API & Voice
         self.tab_api = QWidget()
         self.setup_api_tab()
         self.tabs.addTab(self.tab_api, "API & Voice")
         
-        # Tab 2: Note Types
         self.tab_notes = QWidget()
         self.setup_notes_tab()
         self.tabs.addTab(self.tab_notes, "Note Mappings")
         
-        # Tab 3: Processing & Stats
         self.tab_proc = QWidget()
         self.setup_proc_tab()
-        self.tabs.addTab(self.tab_proc, "Settings & Stats")
+        self.tabs.addTab(self.tab_proc, "Processing & Stats")
         
         main_layout.addWidget(self.tabs)
         
-        # Dialog buttons
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | 
                                    QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
@@ -179,7 +177,8 @@ class ConfigDialog(QDialog):
         form = QFormLayout()
         
         self.api_key = QLineEdit()
-        self.api_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.api_key.setEchoMode(QLineEdit.EchoMode.Normal) # Changed from Password
+        self.api_key.setPlaceholderText("Enter your Gemini API Key")
         form.addRow("Gemini API Key:", self.api_key)
         
         self.primary_model = QLineEdit()
@@ -201,11 +200,10 @@ class ConfigDialog(QDialog):
         
         layout.addLayout(form)
         
-        # System Instruction
         layout.addWidget(QLabel("System Instructions (Optional):"))
         self.system_instruction = QTextEdit()
-        self.system_instruction.setPlaceholderText("E.g., Speak slowly and clearly. Act like a helpful language tutor.")
-        self.system_instruction.setMaximumHeight(100)
+        self.system_instruction.setPlaceholderText("E.g., Speak slowly and clearly.")
+        self.system_instruction.setMaximumHeight(80)
         layout.addWidget(self.system_instruction)
         
         layout.addStretch()
@@ -235,12 +233,21 @@ class ConfigDialog(QDialog):
     def setup_proc_tab(self):
         layout = QVBoxLayout()
         
-        # Settings
-        group_sets = QGroupBox("Processing Settings")
+        group_sets = QGroupBox("Batch Settings")
         form = QFormLayout()
         
         self.skip_existing = QCheckBox("Skip notes with existing audio")
         form.addRow("", self.skip_existing)
+        
+        self.request_wait = QDoubleSpinBox()
+        self.request_wait.setRange(0.0, 10.0)
+        self.request_wait.setSingleStep(0.1)
+        self.request_wait.setSuffix(" sec")
+        form.addRow("Delay between requests:", self.request_wait)
+        
+        self.tag_on_success = QLineEdit()
+        self.tag_on_success.setPlaceholderText("Optional (e.g., tts_generated)")
+        form.addRow("Tag note on success:", self.tag_on_success)
         
         self.retry_attempts = QSpinBox()
         self.retry_attempts.setRange(1, 10)
@@ -253,18 +260,14 @@ class ConfigDialog(QDialog):
         group_sets.setLayout(form)
         layout.addWidget(group_sets)
         
-        # Stats Monitor
-        group_stats = QGroupBox("Profile Usage Statistics")
+        group_stats = QGroupBox("Profile Statistics")
         stats_layout = QFormLayout()
-        
         self.stat_requests = QLabel("0")
         self.stat_input = QLabel("0")
         self.stat_output = QLabel("0")
-        
         stats_layout.addRow("Total Requests:", self.stat_requests)
         stats_layout.addRow("Input Tokens:", self.stat_input)
         stats_layout.addRow("Output Tokens:", self.stat_output)
-        
         group_stats.setLayout(stats_layout)
         layout.addWidget(group_stats)
         
@@ -272,24 +275,17 @@ class ConfigDialog(QDialog):
         self.tab_proc.setLayout(layout)
 
     # --- Profile Logic ---
-    
     def on_profile_change(self, new_name):
         if not new_name: return
-        # Save current UI state to the *previous* profile in memory
         self.save_current_ui_to_memory()
-        # Load new profile
         self.current_profile_name = new_name
         self.load_profile(new_name)
 
     def save_current_ui_to_memory(self):
-        # Update self.profiles[self.current_profile_name] with UI values
-        # We don't overwrite stats here, we preserve them
-        if self.current_profile_name not in self.profiles:
-            return
+        if self.current_profile_name not in self.profiles: return
 
         current_stats = self.profiles[self.current_profile_name].get('stats', {'requests': 0, 'input_tokens': 0, 'output_tokens': 0})
         
-        # Get note configs from list widget
         note_configs = []
         for i in range(self.note_configs.count()):
             item = self.note_configs.item(i)
@@ -307,13 +303,14 @@ class ConfigDialog(QDialog):
             'skip_existing_audio': self.skip_existing.isChecked(),
             'retry_attempts': self.retry_attempts.value(),
             'retry_delay': self.retry_delay.value(),
+            'request_wait': self.request_wait.value(),
+            'tag_on_success': self.tag_on_success.text(),
             'stats': current_stats
         }
 
     def load_profile(self, name):
         p = self.profiles.get(name, self.get_default_profile())
         
-        # Block signals to prevent recursion
         self.profile_combo.blockSignals(True)
         self.profile_combo.setCurrentText(name)
         self.profile_combo.blockSignals(False)
@@ -329,20 +326,26 @@ class ConfigDialog(QDialog):
         self.skip_existing.setChecked(p.get('skip_existing_audio', True))
         self.retry_attempts.setValue(p.get('retry_attempts', 3))
         self.retry_delay.setValue(p.get('retry_delay', 2))
+        self.request_wait.setValue(p.get('request_wait', 0.5))
+        self.tag_on_success.setText(p.get('tag_on_success', ''))
         
-        # Load Stats
         stats = p.get('stats', {'requests': 0, 'input_tokens': 0, 'output_tokens': 0})
         self.stat_requests.setText(str(stats.get('requests', 0)))
         self.stat_input.setText(str(stats.get('input_tokens', 0)))
         self.stat_output.setText(str(stats.get('output_tokens', 0)))
         
-        # Load Note Configs
         self.note_configs.clear()
         for cfg in p.get('note_type_configs', []):
-            item_text = f"{cfg['note_type']}: {cfg['source_field']} → {cfg['target_field']}"
-            item = QListWidgetItem(item_text)
-            item.setData(0x0100, cfg)
-            self.note_configs.addItem(item)
+            self.add_config_item(cfg)
+
+    def add_config_item(self, cfg):
+        status = "[ON] " if cfg.get('enabled', True) else "[OFF] "
+        item_text = f"{status}{cfg['note_type']}: {cfg['source_field']} → {cfg['target_field']}"
+        item = QListWidgetItem(item_text)
+        if not cfg.get('enabled', True):
+            item.setForeground(Qt.GlobalColor.gray)
+        item.setData(0x0100, cfg)
+        self.note_configs.addItem(item)
 
     def add_profile(self):
         name, ok = QInputDialog.getText(self, "New Profile", "Profile Name:")
@@ -350,13 +353,9 @@ class ConfigDialog(QDialog):
             if name in self.profiles:
                 showInfo("Profile already exists")
                 return
-            
-            # Clone current settings for new profile
             self.save_current_ui_to_memory()
             new_profile = self.profiles[self.current_profile_name].copy()
-            # Reset stats for new profile
             new_profile['stats'] = {'requests': 0, 'input_tokens': 0, 'output_tokens': 0}
-            
             self.profiles[name] = new_profile
             self.profile_combo.addItem(name)
             self.on_profile_change(name)
@@ -366,15 +365,12 @@ class ConfigDialog(QDialog):
         new_name, ok = QInputDialog.getText(self, "Rename Profile", "New Name:", text=current)
         if ok and new_name and new_name != current:
             if new_name in self.profiles:
-                showInfo("Profile name already taken")
+                showInfo("Name taken")
                 return
-            
             self.save_current_ui_to_memory()
             data = self.profiles.pop(current)
             self.profiles[new_name] = data
             self.current_profile_name = new_name
-            
-            # Refresh combo
             self.profile_combo.blockSignals(True)
             self.profile_combo.clear()
             self.profile_combo.addItems(sorted(self.profiles.keys()))
@@ -383,40 +379,27 @@ class ConfigDialog(QDialog):
 
     def delete_profile(self):
         if len(self.profiles) <= 1:
-            showInfo("Cannot delete the last profile.")
+            showInfo("Cannot delete last profile")
             return
-            
-        if askUser(f"Delete profile '{self.current_profile_name}'?"):
+        if askUser(f"Delete '{self.current_profile_name}'?"):
             del self.profiles[self.current_profile_name]
-            # Switch to first available
             new_name = sorted(self.profiles.keys())[0]
             self.on_profile_change(new_name)
-            
-            # Refresh combo
             self.profile_combo.blockSignals(True)
             self.profile_combo.clear()
             self.profile_combo.addItems(sorted(self.profiles.keys()))
             self.profile_combo.setCurrentText(new_name)
             self.profile_combo.blockSignals(False)
 
-    # --- Note Config Helpers --- (Same as before)
+    # --- Note Config Helpers ---
     def add_note_config(self):
         note_types = [m['name'] for m in mw.col.models.all()]
-        if not note_types:
-            showInfo("No note types found")
-            return
-        
-        note_type, ok = QInputDialog.getItem(self, "Select Note Type",
-                                             "Choose note type:", note_types, 0, False)
+        if not note_types: return
+        note_type, ok = QInputDialog.getItem(self, "Select Note Type", "Type:", note_types, 0, False)
         if not ok: return
-            
         dialog = NoteTypeConfigDialog(self, note_type)
         if dialog.exec():
-            cfg = dialog.get_config()
-            item_text = f"{cfg['note_type']}: {cfg['source_field']} → {cfg['target_field']}"
-            item = QListWidgetItem(item_text)
-            item.setData(0x0100, cfg)
-            self.note_configs.addItem(item)
+            self.add_config_item(dialog.get_config())
             
     def edit_note_config(self):
         current = self.note_configs.currentItem()
@@ -425,8 +408,13 @@ class ConfigDialog(QDialog):
         dialog = NoteTypeConfigDialog(self, cfg['note_type'], cfg)
         if dialog.exec():
             new_cfg = dialog.get_config()
-            item_text = f"{new_cfg['note_type']}: {new_cfg['source_field']} → {new_cfg['target_field']}"
+            status = "[ON] " if new_cfg.get('enabled', True) else "[OFF] "
+            item_text = f"{status}{new_cfg['note_type']}: {new_cfg['source_field']} → {new_cfg['target_field']}"
             current.setText(item_text)
+            if not new_cfg.get('enabled', True):
+                current.setForeground(Qt.GlobalColor.gray)
+            else:
+                current.setForeground(Qt.GlobalColor.black) # Reset color
             current.setData(0x0100, new_cfg)
             
     def remove_note_config(self):
@@ -435,7 +423,6 @@ class ConfigDialog(QDialog):
             self.note_configs.takeItem(self.note_configs.row(current))
 
     def get_config(self):
-        """Return the full multi-profile configuration"""
         self.save_current_ui_to_memory()
         return {
             'current_profile': self.current_profile_name,

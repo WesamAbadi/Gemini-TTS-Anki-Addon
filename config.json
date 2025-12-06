@@ -5,6 +5,8 @@
     "enable_fallback": true,
     "voice_name": "Zephyr",
     "temperature": 1.0,
+    "request_wait": 0.5,
+    "tag_on_success": "",
     "note_type_configs": [],
     "skip_existing_audio": true,
     "retry_attempts": 3,

@@ -1,10 +1,7 @@
-"""
-Batch TTS Processing Handler
-"""
-
 import time
 import re
 import threading
+from collections import defaultdict
 from typing import List, Dict
 from aqt.qt import QDialog, QVBoxLayout, QProgressBar, QLabel, QPushButton, QTextEdit, QThread, pyqtSignal, Qt
 from aqt import mw
@@ -22,7 +19,7 @@ class ProgressDialog(QDialog):
         
     def setup_ui(self, total_notes: int):
         self.setWindowTitle("Processing Gemini TTS")
-        self.setMinimumWidth(500)
+        self.setMinimumWidth(600)
         self.setWindowModality(Qt.WindowModality.ApplicationModal)
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowType.WindowContextHelpButtonHint)
         
@@ -34,10 +31,11 @@ class ProgressDialog(QDialog):
         self.progress_bar.setMaximum(total_notes)
         self.progress_bar.setValue(0)
         self.progress_bar.setTextVisible(True)
-        self.progress_bar.setFormat("%v / %m") 
+        self.progress_bar.setFormat("%v / %m Notes") 
         layout.addWidget(self.progress_bar)
         
-        self.stats_label = QLabel("Processed: 0 | Success: 0 | Failed: 0")
+        # Updated Stats Label to include Skipped
+        self.stats_label = QLabel("Fields Generated: 0 | Skipped: 0 | Failed: 0")
         layout.addWidget(self.stats_label)
         
         self.usage_label = QLabel("Session Usage - Input: 0 | Output: 0")
@@ -45,18 +43,18 @@ class ProgressDialog(QDialog):
         
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
-        self.log_text.setMaximumHeight(200)
+        self.log_text.setMaximumHeight(300)
         layout.addWidget(self.log_text)
         
         self.cancel_btn = QPushButton("Cancel")
         layout.addWidget(self.cancel_btn)
         self.setLayout(layout)
         
-    def update_progress(self, current: int, status: str, processed: int, 
-                       success: int, failed: int):
-        self.progress_bar.setValue(current)
+    def update_progress(self, current_note_idx: int, status: str, 
+                       success: int, failed: int, skipped: int):
+        self.progress_bar.setValue(current_note_idx)
         self.status_label.setText(status)
-        self.stats_label.setText(f"Processed: {processed} | Success: {success} | Failed: {failed}")
+        self.stats_label.setText(f"Fields Generated: {success} | Skipped: {skipped} | Failed: {failed}")
         
     def update_usage(self, input_tokens, output_tokens):
         self.usage_label.setText(f"Session Usage - Input: {input_tokens} | Output: {output_tokens}")
@@ -77,10 +75,11 @@ class ProgressDialog(QDialog):
 class TTSWorker(QThread):
     """Background worker thread"""
     
+    # note_idx, status_text, success_ops, failed_ops, skipped_ops
     progress_update = pyqtSignal(int, str, int, int, int)
     usage_update = pyqtSignal(int, int)
     log_update = pyqtSignal(str)
-    finished_signal = pyqtSignal(str, dict) # Return summary and final stats
+    finished_signal = pyqtSignal(str, dict)
     
     def __init__(self, note_ids, config, processor):
         super().__init__()
@@ -88,7 +87,12 @@ class TTSWorker(QThread):
         self.config = config
         self.processor = processor
         self.is_cancelled = False
-        self.note_type_map = {cfg['note_type']: cfg for cfg in config['note_type_configs']}
+        
+        # Organize configs: { 'Note Type Name': [ {cfg1}, {cfg2} ] }
+        self.note_type_map = defaultdict(list)
+        for cfg in config['note_type_configs']:
+            if cfg.get('enabled', True): # Only add enabled configs
+                self.note_type_map[cfg['note_type']].append(cfg)
         
         # Session Stats
         self.total_input_tokens = 0
@@ -113,123 +117,148 @@ class TTSWorker(QThread):
         return container['result']
 
     def run(self):
-        success_count = 0
-        failed_count = 0
-        processed_count = 0
-        total = len(self.note_ids)
+        success_ops = 0
+        failed_ops = 0
+        skipped_ops = 0
+        consecutive_errors = 0
         
+        total_notes = len(self.note_ids)
+        request_wait = self.config.get('request_wait', 0.5)
+        tag_on_success = self.config.get('tag_on_success', '')
+
         for idx, note_id in enumerate(self.note_ids):
             if self.is_cancelled:
                 self.log_update.emit("Processing cancelled by user.")
                 break
+                
+            if consecutive_errors >= 5:
+                self.log_update.emit("Aborting: Too many consecutive errors.")
+                break
 
-            # --- READ DATA ---
-            def get_note_data():
+            # --- 1. Get Note and identify Model ---
+            def get_note_basic():
                 try:
                     note = mw.col.get_note(note_id)
-                except: return None, "deleted"
-
-                model = note.note_type()['name']
-                if model not in self.note_type_map: return None, "skip_model"
-                    
-                cfg = self.note_type_map[model]
-                src = cfg['source_field']
-                tgt = cfg['target_field']
-                if src not in note: return None, f"Field '{src}' missing"
-                    
-                text = note[src]
-                if self.config.get('skip_existing_audio', True):
-                    if tgt in note and '[sound:' in note[tgt]:
-                        return None, "exists"
-                return (text, src, tgt), "ok"
-
-            try:
-                data, status = self._run_on_main_sync(get_note_data)
-            except Exception as e:
-                data, status = None, f"Read Error: {str(e)}"
-            
-            if status != "ok":
-                processed_count += 1
-                if status == "skip_model": self.log_update.emit(f"Note {note_id}: Skipped (No config)")
-                elif status == "exists": self.log_update.emit(f"Note {note_id}: Skipped (Audio exists)")
-                elif status == "deleted": self.log_update.emit(f"Note {note_id}: Skipped (Deleted)")
-                else:
-                    failed_count += 1
-                    self.log_update.emit(f"Note {note_id}: Error - {status}")
-                self.progress_update.emit(processed_count, "Skipped...", processed_count, success_count, failed_count)
-                continue
-
-            text, src_field, tgt_field = data
-            clean_text = re.sub(r'<[^>]+>', '', text)
-            clean_text = re.sub(r'\s+', ' ', clean_text).strip()
-            
-            if not clean_text:
-                processed_count += 1
-                failed_count += 1
-                self.log_update.emit(f"Note {note_id}: Failed (Empty text)")
-                self.progress_update.emit(processed_count, "Empty text...", processed_count, success_count, failed_count)
-                continue
-
-            # --- CALL API ---
-            self.progress_update.emit(processed_count, f"Generating ({idx+1}/{total})...", processed_count, success_count, failed_count)
-            
-            audio_data = None
-            model_info = ""
-            stats = {}
+                    return note, note.note_type()['name']
+                except: return None, None
             
             try:
-                audio_data, model_info, stats = self.processor.generate_with_fallback(
-                    clean_text,
-                    self.config['primary_model'],
-                    self.config['fallback_model'],
-                    self.config.get('enable_fallback', True),
-                    self.config.get('retry_attempts', 3),
-                    self.config.get('retry_delay', 2)
-                )
+                note_obj, model_name = self._run_on_main_sync(get_note_basic)
+            except:
+                note_obj = None
+
+            if not note_obj:
+                self.log_update.emit(f"Note {note_id}: Skipped (Deleted/Error)")
+                continue
+
+            # Check if we have configs for this model
+            if model_name not in self.note_type_map:
+                # Log only if verbose, otherwise silent skip implies no config
+                continue
+
+            configs = self.note_type_map[model_name]
+            note_success = False
+
+            # --- 2. Iterate through all mappings for this note ---
+            for map_cfg in configs:
+                if self.is_cancelled: break
+
+                src = map_cfg['source_field']
+                tgt = map_cfg['target_field']
+
+                # Read fields
+                if src not in note_obj:
+                    self.log_update.emit(f"Note {note_id}: Field '{src}' missing")
+                    failed_ops += 1
+                    continue
+
+                text = note_obj[src]
                 
-                # Update Session Stats
-                if stats:
-                    self.total_input_tokens += stats.get('input_tokens', 0)
-                    self.total_output_tokens += stats.get('output_tokens', 0)
-                    if audio_data:
-                        self.total_requests += 1
-                    self.usage_update.emit(self.total_input_tokens, self.total_output_tokens)
-                    
-            except Exception as e:
-                model_info = str(e)
+                # Check existing
+                if self.config.get('skip_existing_audio', True):
+                    if tgt in note_obj and '[sound:' in note_obj[tgt]:
+                        self.log_update.emit(f"Note {note_id} ({src}): Skipped (Audio exists)")
+                        skipped_ops += 1
+                        self.progress_update.emit(idx + 1, "Skipping...", success_ops, failed_ops, skipped_ops)
+                        continue
 
-            # --- WRITE DATA ---
-            if audio_data:
-                def save_result():
-                    filename = f"gemini_tts_{note_id}_{int(time.time())}.wav"
-                    mw.col.media.write_data(filename, audio_data)
-                    try:
-                        note = mw.col.get_note(note_id)
-                        note[tgt_field] = f"[sound:{filename}]"
-                        mw.col.update_note(note)
-                        return True, filename
-                    except: return False, "Note deleted before save"
+                # Clean Text
+                clean_text = re.sub(r'<[^>]+>', '', text)
+                clean_text = re.sub(r'\s+', ' ', clean_text).strip()
+
+                if not clean_text:
+                    self.log_update.emit(f"Note {note_id} ({src}): Skipped (Empty text)")
+                    skipped_ops += 1
+                    continue
+
+                # Apply delay before request
+                if request_wait > 0:
+                    time.sleep(request_wait)
+
+                # --- 3. Generate Audio ---
+                self.progress_update.emit(idx + 1, f"Generating {src}...", success_ops, failed_ops, skipped_ops)
+                
+                audio_data = None
+                model_info = ""
+                stats = {}
 
                 try:
-                    success, msg = self._run_on_main_sync(save_result)
-                    if success:
-                        success_count += 1
-                        used_model_str = f" ({model_info})" if model_info != self.config['primary_model'] else ""
-                        self.log_update.emit(f"Note {note_id}: Success{used_model_str}")
-                    else:
-                        failed_count += 1
-                        self.log_update.emit(f"Note {note_id}: Save Error - {msg}")
+                    audio_data, model_info, stats = self.processor.generate_with_fallback(
+                        clean_text,
+                        self.config['primary_model'],
+                        self.config['fallback_model'],
+                        self.config.get('enable_fallback', True),
+                        self.config.get('retry_attempts', 3),
+                        self.config.get('retry_delay', 2)
+                    )
+                    
+                    if stats:
+                        self.total_input_tokens += stats.get('input_tokens', 0)
+                        self.total_output_tokens += stats.get('output_tokens', 0)
+                        if audio_data:
+                            self.total_requests += 1
+                        self.usage_update.emit(self.total_input_tokens, self.total_output_tokens)
+                
                 except Exception as e:
-                    failed_count += 1
-                    self.log_update.emit(f"Note {note_id}: Save Future Error - {str(e)}")
-            else:
-                failed_count += 1
-                self.log_update.emit(f"Note {note_id}: API Error - {model_info}")
+                    model_info = str(e)
 
-            processed_count += 1
-            self.progress_update.emit(processed_count, "Waiting...", processed_count, success_count, failed_count)
+                # --- 4. Save Audio ---
+                if audio_data:
+                    consecutive_errors = 0 # Reset error counter
+                    
+                    def save_result(nid=note_id, t_field=tgt, data=audio_data, tag=tag_on_success):
+                        filename = f"gemini_tts_{nid}_{int(time.time()*1000)}.wav" # added millis to avoid collision
+                        mw.col.media.write_data(filename, data)
+                        try:
+                            n = mw.col.get_note(nid)
+                            n[t_field] = f"[sound:{filename}]"
+                            if tag:
+                                n.add_tag(tag)
+                            mw.col.update_note(n)
+                            return True, filename
+                        except: return False, "Note deleted"
 
-        summary = f"\nProcessing Complete!\nTotal: {total}\nSuccess: {success_count}\nFailed: {failed_count}\n"
+                    try:
+                        success, msg = self._run_on_main_sync(save_result)
+                        if success:
+                            success_ops += 1
+                            note_success = True
+                            self.log_update.emit(f"Note {note_id} ({src}): Success")
+                        else:
+                            failed_ops += 1
+                            self.log_update.emit(f"Note {note_id} ({src}): Save Error - {msg}")
+                    except Exception as e:
+                        failed_ops += 1
+                        self.log_update.emit(f"Note {note_id}: Save Future Error - {str(e)}")
+                else:
+                    consecutive_errors += 1
+                    failed_ops += 1
+                    self.log_update.emit(f"Note {note_id} ({src}): API Error - {model_info}")
+
+            # End of Note Loop
+            self.progress_update.emit(idx + 1, "Waiting...", success_ops, failed_ops, skipped_ops)
+
+        summary = f"\nProcessing Complete!\nSuccess (Fields): {success_ops}\nSkipped: {skipped_ops}\nFailed: {failed_ops}\n"
         summary += f"Session Tokens: Input {self.total_input_tokens}, Output {self.total_output_tokens}"
         
         final_stats = {
@@ -248,13 +277,10 @@ class BatchTTSHandler:
         self.note_ids = note_ids
         self.global_config = mw.addonManager.getConfig(__name__) or {}
         
-        # Determine active profile config
         self.profile_name = self.global_config.get('current_profile', 'Default')
         profiles = self.global_config.get('profiles', {})
         
-        # If structure is old, wrap it or use default
         if not profiles and 'api_key' in self.global_config:
-            # Old config format detected, treat as default profile
             self.active_config = self.global_config
         else:
             self.active_config = profiles.get(self.profile_name, self.get_default_config())
@@ -270,25 +296,23 @@ class BatchTTSHandler:
             'enable_fallback': True,
             'voice_name': 'Zephyr',
             'temperature': 1.0,
-            'system_instruction': '',
+            'request_wait': 0.5, # Default delay
+            'tag_on_success': '',
             'note_type_configs': [],
             'stats': {'requests': 0, 'input_tokens': 0, 'output_tokens': 0}
         }
         
     def start(self):
-        # 1. Check configuration
         if not self.active_config.get('api_key') or not self.active_config.get('note_type_configs'):
             dialog = ConfigDialog(self.mw, self.global_config)
             if dialog.exec():
                 self.global_config = dialog.get_config()
                 self.mw.addonManager.writeConfig(__name__, self.global_config)
-                # Re-init with new config
                 self.__init__(self.mw, self.note_ids)
                 if not self.active_config.get('api_key'): return 
             else:
                 return
                 
-        # 2. Setup Processor
         processor = TTSProcessor(
             api_key=self.active_config['api_key'],
             voice_name=self.active_config.get('voice_name', 'Zephyr'),
@@ -296,13 +320,11 @@ class BatchTTSHandler:
             system_instruction=self.active_config.get('system_instruction', '')
         )
         
-        # 3. Setup Dialog
         self.dialog = ProgressDialog(self.mw, len(self.note_ids))
         self.dialog.cancel_btn.clicked.connect(self.on_cancel)
         self.dialog.handler_ref = self 
         self.dialog.show()
         
-        # 4. Setup Worker
         self.worker = TTSWorker(self.note_ids, self.active_config, processor)
         self.worker.progress_update.connect(self.dialog.update_progress)
         self.worker.usage_update.connect(self.dialog.update_usage)
@@ -327,21 +349,14 @@ class BatchTTSHandler:
         except: pass
         self.dialog.cancel_btn.clicked.connect(self.close_and_cleanup)
         
-        # --- Update Persistent Stats ---
-        # We need to reload the global config from disk in case it changed elsewhere,
-        # but for simplicity we rely on the object we have + updates
         current_stats = self.active_config.get('stats', {'requests': 0, 'input_tokens': 0, 'output_tokens': 0})
-        
         current_stats['requests'] = current_stats.get('requests', 0) + session_stats['requests']
         current_stats['input_tokens'] = current_stats.get('input_tokens', 0) + session_stats['input_tokens']
         current_stats['output_tokens'] = current_stats.get('output_tokens', 0) + session_stats['output_tokens']
         
-        # Save back to active config object
         self.active_config['stats'] = current_stats
         
-        # Update the specific profile in global config
         if 'profiles' not in self.global_config:
-            # Migration path if config was flat
             self.global_config = {
                 'current_profile': 'Default',
                 'profiles': {'Default': self.active_config}
@@ -350,7 +365,6 @@ class BatchTTSHandler:
             self.global_config['profiles'][self.profile_name] = self.active_config
             
         self.mw.addonManager.writeConfig(__name__, self.global_config)
-        
         self.mw.reset()
         
     def close_and_cleanup(self):
