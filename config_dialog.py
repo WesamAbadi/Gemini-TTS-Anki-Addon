@@ -1,9 +1,32 @@
 from aqt.qt import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
                      QPushButton, QComboBox, QCheckBox, QGroupBox, QFormLayout,
                      QListWidget, QListWidgetItem, QDialogButtonBox, QSpinBox,
-                     QDoubleSpinBox, QTabWidget, QWidget, QTextEdit, QMessageBox, QInputDialog, Qt)
+                     QDoubleSpinBox, QTabWidget, QWidget, QTextEdit, QMessageBox, 
+                     QInputDialog, Qt, QCursor, QDesktopServices, QUrl)
 from aqt.utils import showInfo, askUser
 from aqt import mw
+
+# --- Helper UI Components ---
+
+class HelpLabel(QLabel):
+    """Clickable label that opens a URL"""
+    def __init__(self, text, url, parent=None):
+        super().__init__(text, parent)
+        self.url = url
+        self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.setStyleSheet("color: #2196F3; text-decoration: underline; margin-left: 5px;")
+        self.setToolTip(f"Open {url}")
+
+    def mousePressEvent(self, event):
+        QDesktopServices.openUrl(QUrl(self.url))
+
+class SectionHeader(QLabel):
+    """Styled header for sections"""
+    def __init__(self, text, parent=None):
+        super().__init__(text, parent)
+        self.setStyleSheet("font-weight: bold; font-size: 12px; color: #555; margin-top: 10px; margin-bottom: 5px;")
+
+# --- Dialogs ---
 
 class NoteTypeConfigDialog(QDialog):
     """Dialog for configuring field mappings for a note type"""
@@ -15,7 +38,8 @@ class NoteTypeConfigDialog(QDialog):
         self.setup_ui()
         
     def setup_ui(self):
-        self.setWindowTitle(f"Configure: {self.note_type_name}")
+        self.setWindowTitle(f"Mapping: {self.note_type_name}")
+        self.setMinimumWidth(400)
         layout = QVBoxLayout()
         
         model = mw.col.models.by_name(self.note_type_name)
@@ -36,14 +60,14 @@ class NoteTypeConfigDialog(QDialog):
         if self.config.get('source_field'):
             idx = self.source_field.findText(self.config['source_field'])
             if idx >= 0: self.source_field.setCurrentIndex(idx)
-        form.addRow("Source Text Field:", self.source_field)
+        form.addRow("Source (Text):", self.source_field)
         
         self.target_field = QComboBox()
         self.target_field.addItems(fields)
         if self.config.get('target_field'):
             idx = self.target_field.findText(self.config['target_field'])
             if idx >= 0: self.target_field.setCurrentIndex(idx)
-        form.addRow("Target Audio Field:", self.target_field)
+        form.addRow("Target (Audio):", self.target_field)
         
         layout.addLayout(form)
         
@@ -108,6 +132,7 @@ class ConfigDialog(QDialog):
             'retry_attempts': 3,
             'retry_delay': 2,
             'request_wait': 0.5,
+            'max_concurrent': 1,
             'tag_on_success': '',
             'retry_on_empty': False,
             'verbose_logging': False,
@@ -115,33 +140,41 @@ class ConfigDialog(QDialog):
         }
         
     def setup_ui(self):
-        self.setWindowTitle("TTS Configuration")
-        self.setMinimumWidth(600)
+        self.setWindowTitle("Batch TTS Configuration")
+        self.setMinimumWidth(650)
         self.setMinimumHeight(600)
         
         main_layout = QVBoxLayout()
         
-        # Profile Group
-        profile_group = QGroupBox("Profiles")
-        profile_layout = QHBoxLayout()
+        # Profile Header
+        top_bar = QHBoxLayout()
+        top_bar.addWidget(QLabel("Profile:"))
+        
         self.profile_combo = QComboBox()
         self.profile_combo.addItems(sorted(self.profiles.keys()))
         self.profile_combo.setCurrentText(self.current_profile_name)
         self.profile_combo.currentTextChanged.connect(self.on_profile_change)
+        top_bar.addWidget(self.profile_combo, 1)
+        
+        btn_style = "QPushButton { padding: 3px 8px; }"
         add_btn = QPushButton("+")
-        add_btn.setFixedWidth(30)
+        add_btn.setStyleSheet(btn_style)
         add_btn.clicked.connect(self.add_profile)
+        
         rename_btn = QPushButton("Rename")
+        rename_btn.setStyleSheet(btn_style)
         rename_btn.clicked.connect(self.rename_profile)
+        
         del_btn = QPushButton("Delete")
+        del_btn.setStyleSheet(btn_style)
         del_btn.clicked.connect(self.delete_profile)
-        profile_layout.addWidget(QLabel("Current Profile:"))
-        profile_layout.addWidget(self.profile_combo, 1)
-        profile_layout.addWidget(add_btn)
-        profile_layout.addWidget(rename_btn)
-        profile_layout.addWidget(del_btn)
-        profile_group.setLayout(profile_layout)
-        main_layout.addWidget(profile_group)
+        
+        top_bar.addWidget(add_btn)
+        top_bar.addWidget(rename_btn)
+        top_bar.addWidget(del_btn)
+        
+        main_layout.addLayout(top_bar)
+        main_layout.addSpacing(10)
 
         # Tabs
         self.tabs = QTabWidget()
@@ -156,7 +189,7 @@ class ConfigDialog(QDialog):
         
         self.tab_proc = QWidget()
         self.setup_proc_tab()
-        self.tabs.addTab(self.tab_proc, "Settings & Stats")
+        self.tabs.addTab(self.tab_proc, "Performance & Settings")
         
         main_layout.addWidget(self.tabs)
         
@@ -167,69 +200,91 @@ class ConfigDialog(QDialog):
         main_layout.addWidget(buttons)
         self.setLayout(main_layout)
 
+    def _create_info_row(self, label_text, widget, help_url=None, help_text="Get Info"):
+        row = QHBoxLayout()
+        lbl = QLabel(label_text)
+        lbl.setMinimumWidth(100)
+        row.addWidget(lbl)
+        row.addWidget(widget, 1)
+        if help_url:
+            row.addWidget(HelpLabel(help_text, help_url))
+        return row
+
     def setup_api_tab(self):
         layout = QVBoxLayout()
         
         # Service Selector
         top_h = QHBoxLayout()
-        top_h.addWidget(QLabel("TTS Service:"))
+        top_h.addWidget(QLabel("<b>TTS Service:</b>"))
         self.service_combo = QComboBox()
         self.service_combo.addItems(["Gemini", "ElevenLabs"])
         self.service_combo.currentTextChanged.connect(self.on_service_change)
         top_h.addWidget(self.service_combo, 1)
         layout.addLayout(top_h)
+        layout.addSpacing(15)
         
         # --- GEMINI SETTINGS ---
-        self.gemini_group = QGroupBox("Gemini Settings")
-        g_form = QFormLayout()
+        self.gemini_group = QWidget()
+        g_layout = QVBoxLayout(self.gemini_group)
+        g_layout.setContentsMargins(0,0,0,0)
+        
+        g_layout.addWidget(SectionHeader("Credentials"))
         
         self.api_key = QLineEdit()
         self.api_key.setEchoMode(QLineEdit.EchoMode.Normal)
-        self.api_key.setPlaceholderText("Enter your Gemini API Key")
-        g_form.addRow("API Key:", self.api_key)
+        self.api_key.setPlaceholderText("Enter Gemini API Key")
+        g_layout.addLayout(self._create_info_row("API Key:", self.api_key, "https://aistudio.google.com/app/apikey", "(?) Get Key"))
+        
+        g_layout.addWidget(SectionHeader("Models & Voice"))
         
         self.primary_model = QLineEdit()
-        g_form.addRow("Primary Model:", self.primary_model)
+        g_layout.addLayout(self._create_info_row("Primary Model:", self.primary_model, "https://ai.google.dev/gemini-api/docs/models/gemini", "(?) Models"))
         
         self.fallback_model = QLineEdit()
-        g_form.addRow("Fallback Model:", self.fallback_model)
+        g_layout.addLayout(self._create_info_row("Fallback Model:", self.fallback_model))
         
-        self.enable_fallback = QCheckBox("Enable fallback on rate limit")
-        g_form.addRow("", self.enable_fallback)
+        self.enable_fallback = QCheckBox("Enable fallback on rate limit (429)")
+        g_layout.addWidget(self.enable_fallback)
         
         self.voice_name = QLineEdit()
-        g_form.addRow("Voice Name:", self.voice_name)
+        g_layout.addLayout(self._create_info_row("Voice Name:", self.voice_name))
+        
+        g_layout.addWidget(SectionHeader("Generation Parameters"))
         
         self.temperature = QDoubleSpinBox()
         self.temperature.setRange(0.0, 2.0)
         self.temperature.setSingleStep(0.1)
-        g_form.addRow("Temperature:", self.temperature)
+        g_layout.addLayout(self._create_info_row("Temperature:", self.temperature))
 
         self.system_instruction = QTextEdit()
-        self.system_instruction.setPlaceholderText("E.g., Speak slowly.")
+        self.system_instruction.setPlaceholderText("E.g., Speak slowly. Pronounce clearly.")
         self.system_instruction.setMaximumHeight(60)
-        g_form.addRow("System Instr:", self.system_instruction)
+        g_layout.addWidget(QLabel("System Instructions:"))
+        g_layout.addWidget(self.system_instruction)
         
-        self.gemini_group.setLayout(g_form)
         layout.addWidget(self.gemini_group)
         
         # --- ELEVENLABS SETTINGS ---
-        self.eleven_group = QGroupBox("ElevenLabs Settings")
-        e_form = QFormLayout()
+        self.eleven_group = QWidget()
+        e_layout = QVBoxLayout(self.eleven_group)
+        e_layout.setContentsMargins(0,0,0,0)
+        
+        e_layout.addWidget(SectionHeader("Credentials"))
         
         self.el_api_key = QLineEdit()
         self.el_api_key.setPlaceholderText("Enter ElevenLabs API Key")
-        e_form.addRow("API Key:", self.el_api_key)
+        e_layout.addLayout(self._create_info_row("API Key:", self.el_api_key, "https://elevenlabs.io/app/settings/api-keys", "(?) Get Key"))
         
+        e_layout.addWidget(SectionHeader("Voice Configuration"))
+
         self.el_voice_id = QLineEdit()
         self.el_voice_id.setPlaceholderText("e.g. 21m00Tcm4TlvDq8ikWAM")
-        e_form.addRow("Voice ID:", self.el_voice_id)
+        e_layout.addLayout(self._create_info_row("Voice ID:", self.el_voice_id, "https://elevenlabs.io/app/voice-lab", "(?) Voices"))
         
         self.el_model_id = QLineEdit()
         self.el_model_id.setPlaceholderText("e.g. eleven_turbo_v2_5")
-        e_form.addRow("Model ID:", self.el_model_id)
+        e_layout.addLayout(self._create_info_row("Model ID:", self.el_model_id, "https://elevenlabs.io/docs/api-reference/text-to-speech/convert", "(?) Models"))
         
-        self.eleven_group.setLayout(e_form)
         layout.addWidget(self.eleven_group)
         
         layout.addStretch()
@@ -242,6 +297,9 @@ class ConfigDialog(QDialog):
 
     def setup_notes_tab(self):
         layout = QVBoxLayout()
+        
+        layout.addWidget(QLabel("Map Source Text fields to Target Audio fields per Note Type."))
+        
         self.note_configs = QListWidget()
         layout.addWidget(self.note_configs)
         
@@ -262,50 +320,61 @@ class ConfigDialog(QDialog):
     def setup_proc_tab(self):
         layout = QVBoxLayout()
         
-        group_sets = QGroupBox("Batch Settings")
-        form = QFormLayout()
+        # Performance Settings
+        layout.addWidget(SectionHeader("Performance & Concurrency"))
         
-        self.skip_existing = QCheckBox("Skip notes with existing audio")
-        form.addRow("", self.skip_existing)
+        perf_form = QFormLayout()
         
-        self.verbose_logging = QCheckBox("Show 'Skipped' messages in Log")
-        form.addRow("", self.verbose_logging)
-
-        self.retry_on_empty = QCheckBox("Retry on 'No audio generated' error")
-        self.retry_on_empty.setToolTip("If checked, empty responses are treated as temporary failures and retried.")
-        form.addRow("", self.retry_on_empty)
+        self.max_concurrent = QSpinBox()
+        self.max_concurrent.setRange(1, 10)
+        self.max_concurrent.setToolTip("Higher values are faster but may hit rate limits sooner.")
+        perf_form.addRow("Max Concurrent Requests:", self.max_concurrent)
         
         self.request_wait = QDoubleSpinBox()
         self.request_wait.setRange(0.0, 10.0)
         self.request_wait.setSingleStep(0.1)
         self.request_wait.setSuffix(" sec")
-        form.addRow("Delay between requests:", self.request_wait)
+        perf_form.addRow("Delay after request:", self.request_wait)
         
+        layout.addLayout(perf_form)
+        
+        # Batch Logic
+        layout.addWidget(SectionHeader("Batch Processing Logic"))
+        
+        self.skip_existing = QCheckBox("Skip notes with existing audio in target field")
+        layout.addWidget(self.skip_existing)
+        
+        self.retry_on_empty = QCheckBox("Retry on 'No audio generated' error")
+        layout.addWidget(self.retry_on_empty)
+
+        self.verbose_logging = QCheckBox("Verbose logging (show skipped notes)")
+        layout.addWidget(self.verbose_logging)
+
+        logic_form = QFormLayout()
         self.tag_on_success = QLineEdit()
         self.tag_on_success.setPlaceholderText("Optional (e.g., tts_generated)")
-        form.addRow("Tag note on success:", self.tag_on_success)
+        logic_form.addRow("Tag on Success:", self.tag_on_success)
         
         self.retry_attempts = QSpinBox()
         self.retry_attempts.setRange(1, 10)
-        form.addRow("Retry Attempts:", self.retry_attempts)
+        logic_form.addRow("Retry Attempts:", self.retry_attempts)
         
         self.retry_delay = QSpinBox()
         self.retry_delay.setRange(1, 30)
-        form.addRow("Retry Delay (sec):", self.retry_delay)
+        logic_form.addRow("Retry Delay (sec):", self.retry_delay)
         
-        group_sets.setLayout(form)
-        layout.addWidget(group_sets)
+        layout.addLayout(logic_form)
         
-        group_stats = QGroupBox("Profile Statistics")
+        # Stats
+        layout.addWidget(SectionHeader("Usage Statistics (This Profile)"))
         stats_layout = QFormLayout()
         self.stat_requests = QLabel("0")
         self.stat_input = QLabel("0")
         self.stat_output = QLabel("0")
         stats_layout.addRow("Total Requests:", self.stat_requests)
-        stats_layout.addRow("Input Tokens/Chars:", self.stat_input)
-        stats_layout.addRow("Output Tokens/Approx:", self.stat_output)
-        group_stats.setLayout(stats_layout)
-        layout.addWidget(group_stats)
+        stats_layout.addRow("Total Input (chars/tokens):", self.stat_input)
+        stats_layout.addRow("Total Output:", self.stat_output)
+        layout.addLayout(stats_layout)
         
         layout.addStretch()
         self.tab_proc.setLayout(layout)
@@ -341,6 +410,7 @@ class ConfigDialog(QDialog):
             'retry_attempts': self.retry_attempts.value(),
             'retry_delay': self.retry_delay.value(),
             'request_wait': self.request_wait.value(),
+            'max_concurrent': self.max_concurrent.value(),
             'tag_on_success': self.tag_on_success.text(),
             'retry_on_empty': self.retry_on_empty.isChecked(),
             'verbose_logging': self.verbose_logging.isChecked(),
@@ -352,7 +422,6 @@ class ConfigDialog(QDialog):
             'api_key': self.el_api_key.text(),
             'voice_id': self.el_voice_id.text(),
             'model_id': self.el_model_id.text(),
-            # Preserve hidden options if they existed
             'stability': self.profiles[self.current_profile_name].get('elevenlabs', {}).get('stability', 0.5),
             'similarity_boost': self.profiles[self.current_profile_name].get('elevenlabs', {}).get('similarity_boost', 0.75)
         }
@@ -368,7 +437,7 @@ class ConfigDialog(QDialog):
         # Load Service
         svc = p.get('service', 'gemini').title()
         if svc not in ["Gemini", "Elevenlabs"]: svc = "Gemini"
-        if svc == "Elevenlabs": svc = "ElevenLabs" # casing fix
+        if svc == "Elevenlabs": svc = "ElevenLabs"
         
         self.service_combo.setCurrentText(svc)
         self.on_service_change(svc)
@@ -393,6 +462,7 @@ class ConfigDialog(QDialog):
         self.retry_attempts.setValue(p.get('retry_attempts', 3))
         self.retry_delay.setValue(p.get('retry_delay', 2))
         self.request_wait.setValue(p.get('request_wait', 0.5))
+        self.max_concurrent.setValue(p.get('max_concurrent', 1))
         self.tag_on_success.setText(p.get('tag_on_success', ''))
         self.retry_on_empty.setChecked(p.get('retry_on_empty', False))
         self.verbose_logging.setChecked(p.get('verbose_logging', False))
@@ -407,7 +477,7 @@ class ConfigDialog(QDialog):
             self.add_config_item(cfg)
 
     def add_config_item(self, cfg):
-        status = "[ON] " if cfg.get('enabled', True) else "[OFF] "
+        status = "✅ " if cfg.get('enabled', True) else "❌ "
         item_text = f"{status}{cfg['note_type']}: {cfg['source_field']} → {cfg['target_field']}"
         item = QListWidgetItem(item_text)
         if not cfg.get('enabled', True):
@@ -419,7 +489,7 @@ class ConfigDialog(QDialog):
         name, ok = QInputDialog.getText(self, "New Profile", "Profile Name:")
         if ok and name:
             if name in self.profiles:
-                showInfo("Exists")
+                showInfo("Profile exists!")
                 return
             self.save_current_ui_to_memory()
             new_profile = self.profiles[self.current_profile_name].copy()
@@ -472,7 +542,7 @@ class ConfigDialog(QDialog):
         dialog = NoteTypeConfigDialog(self, cfg['note_type'], cfg)
         if dialog.exec():
             new_cfg = dialog.get_config()
-            status = "[ON] " if new_cfg.get('enabled', True) else "[OFF] "
+            status = "✅ " if new_cfg.get('enabled', True) else "❌ "
             item_text = f"{status}{new_cfg['note_type']}: {new_cfg['source_field']} → {new_cfg['target_field']}"
             current.setText(item_text)
             if not new_cfg.get('enabled', True):

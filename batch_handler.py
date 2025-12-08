@@ -2,8 +2,9 @@ import time
 import re
 import threading
 import json
+import concurrent.futures
 from collections import defaultdict
-from typing import List, Dict
+from typing import List, Dict, Optional
 from aqt.qt import QDialog, QVBoxLayout, QProgressBar, QLabel, QPushButton, QTextEdit, QThread, pyqtSignal, Qt, QFont
 from aqt import mw
 from .config_dialog import ConfigDialog
@@ -34,15 +35,17 @@ class ProgressDialog(QDialog):
         
         # Progress Bar
         self.progress_bar = QProgressBar()
+        # We don't know exact total fields until we scan, so we might estimate or update
+        # For concurrency, we just track "processed" vs "total notes" roughly
         self.progress_bar.setMaximum(total_notes)
         self.progress_bar.setValue(0)
         self.progress_bar.setTextVisible(True)
-        self.progress_bar.setFormat("%v / %m Notes")
+        self.progress_bar.setFormat("%v / %m Items Processed")
         self.progress_bar.setStyleSheet("QProgressBar { height: 20px; }")
         layout.addWidget(self.progress_bar)
         
         # Stats
-        self.stats_label = QLabel("Fields Generated: 0 | Skipped: 0 | Failed: 0")
+        self.stats_label = QLabel("Success: 0 | Skipped: 0 | Failed: 0")
         layout.addWidget(self.stats_label)
         
         self.usage_label = QLabel("Session Usage - Input: 0 | Output: 0")
@@ -61,15 +64,14 @@ class ProgressDialog(QDialog):
         layout.addWidget(self.cancel_btn)
         self.setLayout(layout)
         
-    def update_progress(self, current_note_idx: int, status: str, 
+    def update_progress(self, current_val: int, status: str, 
                        success: int, failed: int, skipped: int):
-        self.progress_bar.setValue(current_note_idx)
+        self.progress_bar.setValue(current_val)
         self.status_label.setText(status)
-        self.stats_label.setText(f"Fields Generated: {success} | Skipped: {skipped} | Failed: {failed}")
+        self.stats_label.setText(f"Success: {success} | Skipped: {skipped} | Failed: {failed}")
         
     def update_usage(self, input_tokens, output_tokens):
-        # Determine label based on service context implicitly or generic text
-        self.usage_label.setText(f"Session Usage - Input: {input_tokens} chars/tokens | Output: {output_tokens} (approx)")
+        self.usage_label.setText(f"Session Usage - Input: {input_tokens} | Output: {output_tokens}")
         
     def add_log_html(self, html_msg: str):
         self.log_text.append(html_msg)
@@ -85,7 +87,7 @@ class ProgressDialog(QDialog):
 
 
 class TTSWorker(QThread):
-    """Background worker thread"""
+    """Background worker thread that manages a thread pool for concurrent API requests"""
     
     progress_update = pyqtSignal(int, str, int, int, int)
     usage_update = pyqtSignal(int, int)
@@ -99,6 +101,7 @@ class TTSWorker(QThread):
         self.processor = processor
         self.is_cancelled = False
         
+        # Organize config for fast lookup
         self.note_type_map = defaultdict(list)
         for cfg in config['note_type_configs']:
             if cfg.get('enabled', True):
@@ -107,8 +110,14 @@ class TTSWorker(QThread):
         self.total_input_tokens = 0
         self.total_output_tokens = 0
         self.total_requests = 0
+        
+        self.success_ops = 0
+        self.failed_ops = 0
+        self.skipped_ops = 0
+        self.processed_count = 0
 
     def _run_on_main_sync(self, func):
+        """Run a function on the main thread and wait for result"""
         container = {'result': None, 'error': None}
         event = threading.Event()
         def wrapper():
@@ -128,158 +137,197 @@ class TTSWorker(QThread):
     def _format_error(self, error_str: str) -> str:
         error_str = str(error_str)
         if len(error_str) > 150:
-            return f"Error: {error_str[:150]}..."
-        return f"Error: {error_str}"
+            return f"{error_str[:150]}..."
+        return error_str
 
     def run(self):
-        success_ops = 0
-        failed_ops = 0
-        skipped_ops = 0
-        consecutive_errors = 0
+        # 1. Prepare Work Items
+        # We need to scan notes on main thread to check which ones need generation
+        self.log_html_update.emit("Scanning notes...")
         
-        request_wait = self.config.get('request_wait', 0.5)
-        tag_on_success = self.config.get('tag_on_success', '')
-        verbose = self.config.get('verbose_logging', False)
-        retry_empty = self.config.get('retry_on_empty', False)
-
-        check_cancel = lambda: self.is_cancelled
-
-        for idx, note_id in enumerate(self.note_ids):
-            if self.is_cancelled:
-                self.log_html_update.emit("<span style='color:orange'>Processing cancelled by user.</span>")
-                break
-                
-            if consecutive_errors >= 5:
-                self.log_html_update.emit("<span style='color:red; font-weight:bold'>Aborting: 5 consecutive errors.</span>")
-                break
-
-            def get_note_basic():
-                try:
-                    note = mw.col.get_note(note_id)
-                    return note, note.note_type()['name']
-                except: return None, None
-            
-            try:
-                note_obj, model_name = self._run_on_main_sync(get_note_basic)
-            except:
-                note_obj = None
-
-            if not note_obj:
-                if verbose: self.log_html_update.emit(f"<span style='color:gray'>Note {note_id}: Skipped (Deleted/Error)</span>")
-                continue
-
-            if model_name not in self.note_type_map:
-                continue
-
-            configs = self.note_type_map[model_name]
-
-            for map_cfg in configs:
+        work_items = []
+        
+        def prepare_tasks():
+            tasks = []
+            for nid in self.note_ids:
                 if self.is_cancelled: break
-
-                src = map_cfg['source_field']
-                tgt = map_cfg['target_field']
-
-                if src not in note_obj:
-                    self.log_html_update.emit(f"<span style='color:red'>Note {note_id}: Field '{src}' missing</span>")
-                    failed_ops += 1
-                    continue
-
-                text = note_obj[src]
-                
-                if self.config.get('skip_existing_audio', True):
-                    if tgt in note_obj and '[sound:' in note_obj[tgt]:
-                        skipped_ops += 1
-                        if verbose:
-                            self.log_html_update.emit(f"<span style='color:gray'>Note {note_id} ({src}): Skipped (Audio exists)</span>")
-                        self.progress_update.emit(idx + 1, "Skipping...", success_ops, failed_ops, skipped_ops)
-                        time.sleep(0.01) 
-                        continue
-
-                clean_text = re.sub(r'<[^>]+>', '', text)
-                clean_text = re.sub(r'\s+', ' ', clean_text).strip()
-
-                if not clean_text:
-                    if verbose: self.log_html_update.emit(f"<span style='color:gray'>Note {note_id} ({src}): Skipped (Empty text)</span>")
-                    skipped_ops += 1
-                    time.sleep(0.01)
-                    continue
-
-                if request_wait > 0:
-                    for _ in range(int(request_wait * 10)):
-                        if self.is_cancelled: break
-                        time.sleep(0.1)
-
-                if self.is_cancelled: break
-
-                self.progress_update.emit(idx + 1, f"Generating {src}...", success_ops, failed_ops, skipped_ops)
-                
-                audio_data = None
-                model_info = ""
-                stats = {}
-                error_msg = ""
-
                 try:
-                    # Pass specific models only if using Gemini, otherwise processor handles it based on service
-                    audio_data, model_info, stats = self.processor.generate_with_fallback(
-                        clean_text,
-                        self.config.get('primary_model', ''),
-                        self.config.get('fallback_model', ''),
-                        self.config.get('enable_fallback', True),
-                        self.config.get('retry_attempts', 3),
-                        self.config.get('retry_delay', 2),
-                        retry_empty,
-                        check_cancel
-                    )
+                    note = mw.col.get_note(nid)
+                    model_name = note.note_type()['name']
                     
+                    if model_name in self.note_type_map:
+                        for map_cfg in self.note_type_map[model_name]:
+                            src = map_cfg['source_field']
+                            tgt = map_cfg['target_field']
+                            
+                            if src not in note:
+                                continue
+                                
+                            # Check existing
+                            if self.config.get('skip_existing_audio', True):
+                                if tgt in note and '[sound:' in note[tgt]:
+                                    self.skipped_ops += 1
+                                    if self.config.get('verbose_logging', False):
+                                        self.log_html_update.emit(f"<span style='color:gray'>Note {nid} ({src}): Skipped (Audio exists)</span>")
+                                    continue
+                            
+                            text = note[src]
+                            clean_text = re.sub(r'<[^>]+>', '', text)
+                            clean_text = re.sub(r'\s+', ' ', clean_text).strip()
+                            
+                            if not clean_text:
+                                self.skipped_ops += 1
+                                continue
+                                
+                            tasks.append({
+                                'nid': nid,
+                                'src_field': src,
+                                'tgt_field': tgt,
+                                'text': clean_text,
+                                'raw_text': text # for logging reference
+                            })
+                except Exception:
+                    continue
+            return tasks
+
+        try:
+            work_items = self._run_on_main_sync(prepare_tasks)
+        except Exception as e:
+            self.log_html_update.emit(f"<span style='color:red'>Error scanning notes: {str(e)}</span>")
+            return
+
+        total_items = len(work_items)
+        if total_items == 0:
+            self.finished_signal.emit("No items to process.", {})
+            return
+
+        # Update Progress Bar Range
+        self.progress_update.emit(0, "Starting...", self.success_ops, self.failed_ops, self.skipped_ops)
+        
+        # 2. Configure Thread Pool
+        max_workers = self.config.get('max_concurrent', 1)
+        request_wait = self.config.get('request_wait', 0.1)
+        tag = self.config.get('tag_on_success', '')
+        
+        # Prefix for filename
+        svc_prefix = "elevenlabs" if self.processor.service == "elevenlabs" else "gemini"
+
+        # 3. Execution Function (Runs in Worker Thread)
+        def process_item(item):
+            if self.is_cancelled: return None
+            
+            # Artificial delay if configured, to prevent blasting API
+            if request_wait > 0:
+                time.sleep(request_wait)
+
+            result = {
+                'item': item,
+                'audio': None,
+                'model': '',
+                'stats': {},
+                'error': None
+            }
+            
+            check_cancel = lambda: self.is_cancelled
+
+            try:
+                # Generate Audio (Blocking Network Call)
+                audio_data, model_info, stats = self.processor.generate_with_fallback(
+                    item['text'],
+                    self.config.get('primary_model', ''),
+                    self.config.get('fallback_model', ''),
+                    self.config.get('enable_fallback', True),
+                    self.config.get('retry_attempts', 3),
+                    self.config.get('retry_delay', 2),
+                    self.config.get('retry_on_empty', False),
+                    check_cancel
+                )
+                
+                result['audio'] = audio_data
+                result['model'] = model_info
+                result['stats'] = stats
+                
+            except Exception as e:
+                result['error'] = str(e)
+                
+            return result
+
+        # 4. Start Processing
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_item = {executor.submit(process_item, item): item for item in work_items}
+            
+            for future in concurrent.futures.as_completed(future_to_item):
+                if self.is_cancelled:
+                    break
+
+                try:
+                    res = future.result()
+                    if not res: continue # Cancelled inside
+
+                    item = res['item']
+                    stats = res.get('stats', {})
+                    
+                    # Update Stats
                     if stats:
                         self.total_input_tokens += stats.get('input_tokens', 0)
                         self.total_output_tokens += stats.get('output_tokens', 0)
-                        if audio_data:
+                        if res['audio']:
                             self.total_requests += 1
                         self.usage_update.emit(self.total_input_tokens, self.total_output_tokens)
-                
-                except Exception as e:
-                    error_msg = self._format_error(str(e))
-                    model_info = error_msg
-
-                if audio_data:
-                    consecutive_errors = 0
-                    prefix = "elevenlabs" if self.processor.service == "elevenlabs" else "gemini"
                     
-                    def save_result(nid=note_id, t_field=tgt, data=audio_data, tag=tag_on_success, pfx=prefix):
-                        filename = f"{pfx}_tts_{nid}_{int(time.time()*1000)}.wav"
-                        mw.col.media.write_data(filename, data)
-                        try:
-                            n = mw.col.get_note(nid)
-                            n[t_field] = f"[sound:{filename}]"
-                            if tag: n.add_tag(tag)
-                            mw.col.update_note(n)
-                            return True, filename
-                        except: return False, "Note deleted"
+                    if res['audio']:
+                        # Save on Main Thread (Critical Section)
+                        def save_audio_to_note():
+                            try:
+                                filename = f"{svc_prefix}_tts_{item['nid']}_{int(time.time()*1000)}.wav"
+                                mw.col.media.write_data(filename, res['audio'])
+                                
+                                n = mw.col.get_note(item['nid'])
+                                n[item['tgt_field']] = f"[sound:{filename}]"
+                                if tag: n.add_tag(tag)
+                                mw.col.update_note(n)
+                                return True, None
+                            except Exception as e:
+                                return False, str(e)
 
-                    try:
-                        success, msg = self._run_on_main_sync(save_result)
-                        if success:
-                            success_ops += 1
-                            self.log_html_update.emit(f"Note {note_id} ({src}): <span style='color:green; font-weight:bold'>Success ({model_info})</span>")
+                        saved, save_err = self._run_on_main_sync(save_audio_to_note)
+                        
+                        if saved:
+                            self.success_ops += 1
+                            self.log_html_update.emit(
+                                f"Note {item['nid']} ({item['src_field']}): "
+                                f"<span style='color:green; font-weight:bold'>Success ({res['model']})</span>"
+                            )
                         else:
-                            failed_ops += 1
-                            self.log_html_update.emit(f"<span style='color:red'>Note {note_id} ({src}): Save Error - {msg}</span>")
-                    except Exception as e:
-                        failed_ops += 1
-                        self.log_html_update.emit(f"<span style='color:red'>Note {note_id}: Save Future Error - {str(e)}</span>")
-                else:
-                    consecutive_errors += 1
-                    failed_ops += 1
-                    display_err = error_msg if error_msg else self._format_error(model_info)
-                    self.log_html_update.emit(f"Note {note_id} ({src}): <span style='color:red'>{display_err}</span>")
+                            self.failed_ops += 1
+                            self.log_html_update.emit(f"<span style='color:red'>Note {item['nid']}: Save Error - {save_err}</span>")
+                    
+                    else:
+                        self.failed_ops += 1
+                        # Error formatting
+                        err_msg = res.get('error') or res.get('model') or "Unknown Error"
+                        display_err = self._format_error(err_msg)
+                        self.log_html_update.emit(f"Note {item['nid']} ({item['src_field']}): <span style='color:red'>{display_err}</span>")
 
-            self.progress_update.emit(idx + 1, "Waiting...", success_ops, failed_ops, skipped_ops)
+                except Exception as exc:
+                    self.failed_ops += 1
+                    self.log_html_update.emit(f"<span style='color:red'>Worker Exception: {str(exc)}</span>")
+                
+                self.processed_count += 1
+                
+                # Update UI Progress
+                # Total progress = processed_count + initial skipped_ops
+                # But progress bar is mapped to work_items + skipped_ops?
+                # Actually, simpler: Set progress bar max to total initial notes?
+                # The scan step filters notes.
+                # Let's just update based on processed count relative to work_items
+                self.progress_update.emit(self.processed_count, "Processing...", self.success_ops, self.failed_ops, self.skipped_ops)
 
+        # 5. Finalize
         summary = f"<br><b>Processing Complete!</b><br>"
-        summary += f"<span style='color:green'>Success (Fields): {success_ops}</span><br>"
-        summary += f"<span style='color:gray'>Skipped: {skipped_ops}</span><br>"
-        summary += f"<span style='color:red'>Failed: {failed_ops}</span><br>"
+        summary += f"<span style='color:green'>Success: {self.success_ops}</span><br>"
+        summary += f"<span style='color:gray'>Skipped: {self.skipped_ops}</span><br>"
+        summary += f"<span style='color:red'>Failed: {self.failed_ops}</span><br>"
         summary += f"<i>Session Usage: Input {self.total_input_tokens}, Output {self.total_output_tokens}</i>"
         
         final_stats = {
@@ -301,7 +349,6 @@ class BatchTTSHandler:
         self.profile_name = self.global_config.get('current_profile', 'Default')
         profiles = self.global_config.get('profiles', {})
         
-        # Backward compatibility for old config structure
         if not profiles and 'api_key' in self.global_config:
             self.active_config = self.global_config
         else:
@@ -320,6 +367,7 @@ class BatchTTSHandler:
             'voice_name': 'Zephyr',
             'temperature': 1.0,
             'request_wait': 0.5,
+            'max_concurrent': 1,
             'retry_on_empty': False,
             'verbose_logging': False,
             'tag_on_success': '',
@@ -348,7 +396,6 @@ class BatchTTSHandler:
             if dialog.exec():
                 self.global_config = dialog.get_config()
                 self.mw.addonManager.writeConfig(__name__, self.global_config)
-                # Re-init to load new config
                 self.__init__(self.mw, self.note_ids)
                 if not self.validate_config(): return 
             else:
@@ -359,7 +406,7 @@ class BatchTTSHandler:
 
         processor = TTSProcessor(
             service=service,
-            api_key=self.active_config['api_key'], # Gemini key
+            api_key=self.active_config['api_key'],
             voice_name=self.active_config.get('voice_name', 'Zephyr'),
             temperature=self.active_config.get('temperature', 1.0),
             system_instruction=self.active_config.get('system_instruction', ''),
@@ -368,6 +415,7 @@ class BatchTTSHandler:
             elevenlabs_model=el_config.get('model_id', 'eleven_turbo_v2_5')
         )
         
+        # We don't know exactly how many items until the worker scans, but pass notes count
         self.dialog = ProgressDialog(self.mw, len(self.note_ids))
         self.dialog.cancel_btn.clicked.connect(self.on_cancel)
         self.dialog.handler_ref = self 
@@ -389,7 +437,6 @@ class BatchTTSHandler:
     def on_finished(self, summary, session_stats):
         self.dialog.add_log_html(summary)
         self.dialog.status_label.setText("Done")
-        self.dialog.progress_bar.setValue(len(self.note_ids))
         
         self.dialog.cancel_btn.setText("Close")
         self.dialog.cancel_btn.setEnabled(True)
