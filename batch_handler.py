@@ -35,8 +35,6 @@ class ProgressDialog(QDialog):
         
         # Progress Bar
         self.progress_bar = QProgressBar()
-        # We don't know exact total fields until we scan, so we might estimate or update
-        # For concurrency, we just track "processed" vs "total notes" roughly
         self.progress_bar.setMaximum(total_notes)
         self.progress_bar.setValue(0)
         self.progress_bar.setTextVisible(True)
@@ -90,6 +88,7 @@ class TTSWorker(QThread):
     """Background worker thread that manages a thread pool for concurrent API requests"""
     
     progress_update = pyqtSignal(int, str, int, int, int)
+    max_update = pyqtSignal(int)  # New signal to update progress bar range
     usage_update = pyqtSignal(int, int)
     log_html_update = pyqtSignal(str) 
     finished_signal = pyqtSignal(str, dict)
@@ -142,7 +141,6 @@ class TTSWorker(QThread):
 
     def run(self):
         # 1. Prepare Work Items
-        # We need to scan notes on main thread to check which ones need generation
         self.log_html_update.emit("Scanning notes...")
         
         work_items = []
@@ -184,7 +182,7 @@ class TTSWorker(QThread):
                                 'src_field': src,
                                 'tgt_field': tgt,
                                 'text': clean_text,
-                                'raw_text': text # for logging reference
+                                'raw_text': text
                             })
                 except Exception:
                     continue
@@ -196,27 +194,34 @@ class TTSWorker(QThread):
             self.log_html_update.emit(f"<span style='color:red'>Error scanning notes: {str(e)}</span>")
             return
 
+        # 2. Update Progress Bar Range
+        # Total operations = items to process + items already skipped
+        total_ops = len(work_items) + self.skipped_ops
+        self.max_update.emit(total_ops)
+        
+        # Start progress at skipped count
+        self.processed_count = self.skipped_ops
+        self.progress_update.emit(self.processed_count, "Starting...", self.success_ops, self.failed_ops, self.skipped_ops)
+        
         total_items = len(work_items)
         if total_items == 0:
-            self.finished_signal.emit("No items to process.", {})
+            # If everything was skipped, we are done
+            self.progress_update.emit(total_ops, "Done", self.success_ops, self.failed_ops, self.skipped_ops)
+            summary = f"<br><b>Processing Complete!</b><br>Skipped: {self.skipped_ops}"
+            self.finished_signal.emit(summary, {})
             return
 
-        # Update Progress Bar Range
-        self.progress_update.emit(0, "Starting...", self.success_ops, self.failed_ops, self.skipped_ops)
-        
-        # 2. Configure Thread Pool
+        # 3. Configure Thread Pool
         max_workers = self.config.get('max_concurrent', 1)
         request_wait = self.config.get('request_wait', 0.1)
         tag = self.config.get('tag_on_success', '')
         
-        # Prefix for filename
         svc_prefix = "elevenlabs" if self.processor.service == "elevenlabs" else "gemini"
 
-        # 3. Execution Function (Runs in Worker Thread)
+        # 4. Execution Function
         def process_item(item):
             if self.is_cancelled: return None
             
-            # Artificial delay if configured, to prevent blasting API
             if request_wait > 0:
                 time.sleep(request_wait)
 
@@ -231,7 +236,6 @@ class TTSWorker(QThread):
             check_cancel = lambda: self.is_cancelled
 
             try:
-                # Generate Audio (Blocking Network Call)
                 audio_data, model_info, stats = self.processor.generate_with_fallback(
                     item['text'],
                     self.config.get('primary_model', ''),
@@ -252,7 +256,7 @@ class TTSWorker(QThread):
                 
             return result
 
-        # 4. Start Processing
+        # 5. Start Processing Loop
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_item = {executor.submit(process_item, item): item for item in work_items}
             
@@ -262,12 +266,11 @@ class TTSWorker(QThread):
 
                 try:
                     res = future.result()
-                    if not res: continue # Cancelled inside
+                    if not res: continue
 
                     item = res['item']
                     stats = res.get('stats', {})
                     
-                    # Update Stats
                     if stats:
                         self.total_input_tokens += stats.get('input_tokens', 0)
                         self.total_output_tokens += stats.get('output_tokens', 0)
@@ -276,7 +279,6 @@ class TTSWorker(QThread):
                         self.usage_update.emit(self.total_input_tokens, self.total_output_tokens)
                     
                     if res['audio']:
-                        # Save on Main Thread (Critical Section)
                         def save_audio_to_note():
                             try:
                                 filename = f"{svc_prefix}_tts_{item['nid']}_{int(time.time()*1000)}.wav"
@@ -304,7 +306,6 @@ class TTSWorker(QThread):
                     
                     else:
                         self.failed_ops += 1
-                        # Error formatting
                         err_msg = res.get('error') or res.get('model') or "Unknown Error"
                         display_err = self._format_error(err_msg)
                         self.log_html_update.emit(f"Note {item['nid']} ({item['src_field']}): <span style='color:red'>{display_err}</span>")
@@ -314,16 +315,9 @@ class TTSWorker(QThread):
                     self.log_html_update.emit(f"<span style='color:red'>Worker Exception: {str(exc)}</span>")
                 
                 self.processed_count += 1
-                
-                # Update UI Progress
-                # Total progress = processed_count + initial skipped_ops
-                # But progress bar is mapped to work_items + skipped_ops?
-                # Actually, simpler: Set progress bar max to total initial notes?
-                # The scan step filters notes.
-                # Let's just update based on processed count relative to work_items
                 self.progress_update.emit(self.processed_count, "Processing...", self.success_ops, self.failed_ops, self.skipped_ops)
 
-        # 5. Finalize
+        # 6. Finalize
         summary = f"<br><b>Processing Complete!</b><br>"
         summary += f"<span style='color:green'>Success: {self.success_ops}</span><br>"
         summary += f"<span style='color:gray'>Skipped: {self.skipped_ops}</span><br>"
@@ -415,17 +409,21 @@ class BatchTTSHandler:
             elevenlabs_model=el_config.get('model_id', 'eleven_turbo_v2_5')
         )
         
-        # We don't know exactly how many items until the worker scans, but pass notes count
+        # Initialize dialog with estimated note count first
         self.dialog = ProgressDialog(self.mw, len(self.note_ids))
         self.dialog.cancel_btn.clicked.connect(self.on_cancel)
         self.dialog.handler_ref = self 
         self.dialog.show()
         
         self.worker = TTSWorker(self.note_ids, self.active_config, processor)
+        
+        # Connect signals
         self.worker.progress_update.connect(self.dialog.update_progress)
+        self.worker.max_update.connect(self.dialog.progress_bar.setMaximum) # Correctly update Range
         self.worker.usage_update.connect(self.dialog.update_usage)
         self.worker.log_html_update.connect(self.dialog.add_log_html)
         self.worker.finished_signal.connect(self.on_finished)
+        
         self.worker.start()
         
     def on_cancel(self):
