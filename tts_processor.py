@@ -1,9 +1,17 @@
 import struct
 import time
 import mimetypes
+import json
+import requests
 from typing import Optional, Tuple, Dict, Callable
-from google import genai
-from google.genai import types
+
+# Use try-import for google-genai so it doesn't crash if only using ElevenLabs and lib is missing
+try:
+    from google import genai
+    from google.genai import types
+    HAS_GOOGLE = True
+except ImportError:
+    HAS_GOOGLE = False
 
 class RateLimitError(Exception):
     pass
@@ -12,32 +20,101 @@ class EmptyResponseError(Exception):
     pass
 
 class TTSProcessor:
-    """Handles TTS generation via Gemini API"""
+    """Handles TTS generation via Gemini API or ElevenLabs API"""
     
-    def __init__(self, api_key: str, voice_name: str = "Zephyr", temperature: float = 1.0, system_instruction: str = None):
+    def __init__(self, service: str = "gemini", api_key: str = "", 
+                 voice_name: str = "Zephyr", temperature: float = 1.0, 
+                 system_instruction: str = None,
+                 elevenlabs_api_key: str = "",
+                 elevenlabs_voice_id: str = "",
+                 elevenlabs_model: str = "eleven_turbo_v2_5"):
+        
+        self.service = service.lower()
+        
+        # Gemini Config
         self.api_key = api_key
         self.voice_name = voice_name
         self.temperature = temperature
         self.system_instruction = system_instruction
         self.client = None
         
+        # ElevenLabs Config
+        self.el_api_key = elevenlabs_api_key
+        self.el_voice_id = elevenlabs_voice_id
+        self.el_model = elevenlabs_model
+        
     def initialize_client(self):
-        """Initialize Gemini client"""
-        if not self.client:
+        """Initialize Gemini client if needed"""
+        if self.service == "gemini" and HAS_GOOGLE and not self.client and self.api_key:
             self.client = genai.Client(api_key=self.api_key)
+
+    def _generate_elevenlabs(self, text: str, check_cancel: Callable[[], bool]) -> Tuple[Optional[bytes], Dict]:
+        """Internal method to handle ElevenLabs generation"""
+        if not self.el_api_key or not self.el_voice_id:
+            raise Exception("ElevenLabs API Key or Voice ID missing.")
+
+        url = f"https://api.elevenlabs.io/v1/text-to-speech/{self.el_voice_id}"
+        
+        headers = {
+            "Accept": "audio/mpeg",
+            "Content-Type": "application/json",
+            "xi-api-key": self.el_api_key
+        }
+        
+        data = {
+            "text": text,
+            "model_id": self.el_model,
+            "voice_settings": {
+                "stability": 0.5,
+                "similarity_boost": 0.75
+            }
+        }
+        
+        if check_cancel and check_cancel():
+            return None, {}
+
+        # ElevenLabs charges by character count (input)
+        usage_stats = {'input_tokens': len(text), 'output_tokens': 0} 
+
+        try:
+            response = requests.post(url, json=data, headers=headers, stream=True)
             
-    def generate_audio(self, text: str, model: str, max_retries: int = 3, 
-                      retry_delay: int = 2, retry_on_empty: bool = False,
-                      check_cancel: Callable[[], bool] = None) -> Tuple[Optional[bytes], Dict]:
-        """
-        Generate audio and return data + usage stats
-        """
+            if response.status_code == 429:
+                raise RateLimitError("ElevenLabs Rate Limit Hit")
+            
+            if response.status_code != 200:
+                try:
+                    err = response.json()
+                    msg = err.get('detail', {}).get('message', str(err))
+                except:
+                    msg = response.text
+                raise Exception(f"ElevenLabs Error {response.status_code}: {msg}")
+
+            audio_data = b""
+            for chunk in response.iter_content(chunk_size=1024):
+                if check_cancel and check_cancel():
+                    return None, usage_stats
+                if chunk:
+                    audio_data += chunk
+            
+            if not audio_data:
+                raise EmptyResponseError("Empty audio received from ElevenLabs")
+                
+            return audio_data, usage_stats
+
+        except Exception as e:
+            if isinstance(e, (RateLimitError, EmptyResponseError)):
+                raise e
+            raise Exception(f"ElevenLabs Request Failed: {str(e)}")
+
+    def _generate_gemini(self, text: str, model: str, retry_on_empty: bool, check_cancel: Callable[[], bool]) -> Tuple[Optional[bytes], Dict]:
+        """Internal method to handle Gemini generation"""
+        if not HAS_GOOGLE:
+            raise Exception("google-genai library not installed.")
+        
         self.initialize_client()
         usage_stats = {'input_tokens': 0, 'output_tokens': 0}
         
-        if not text or not text.strip():
-            return None, usage_stats
-
         final_text = text
         if self.system_instruction and self.system_instruction.strip():
             final_text = f"{self.system_instruction.strip()}\n{text}"
@@ -61,50 +138,73 @@ class TTSProcessor:
             ),
         )
         
+        audio_chunks = []
+        mime_type = None
+        
+        try:
+            for chunk in self.client.models.generate_content_stream(
+                model=model,
+                contents=contents,
+                config=generate_content_config,
+            ):
+                if check_cancel and check_cancel():
+                    return None, usage_stats
+
+                if hasattr(chunk, 'usage_metadata') and chunk.usage_metadata:
+                    usage_stats['input_tokens'] = chunk.usage_metadata.prompt_token_count or 0
+                    usage_stats['output_tokens'] = chunk.usage_metadata.candidates_token_count or 0
+
+                if (chunk.candidates and 
+                    chunk.candidates[0].content and 
+                    chunk.candidates[0].content.parts):
+                    
+                    part = chunk.candidates[0].content.parts[0]
+                    
+                    if part.inline_data and part.inline_data.data:
+                        audio_chunks.append(part.inline_data.data)
+                        if not mime_type:
+                            mime_type = part.inline_data.mime_type
+                            
+            if audio_chunks:
+                audio_data = b''.join(audio_chunks)
+                ext = mimetypes.guess_extension(mime_type) if mime_type else None
+                if ext is None or 'wav' not in str(ext).lower():
+                    final_audio = self.convert_to_wav(audio_data, mime_type or "audio/wav")
+                    return final_audio, usage_stats
+                return audio_data, usage_stats
+            
+            if retry_on_empty:
+                raise EmptyResponseError("Received empty audio stream from API.")
+            
+            return None, usage_stats
+
+        except Exception as e:
+            error_msg = str(e).lower()
+            if '429' in error_msg or 'resource_exhausted' in error_msg:
+                raise RateLimitError(str(e))
+            raise e
+
+    def generate_audio(self, text: str, model: str, max_retries: int = 3, 
+                      retry_delay: int = 2, retry_on_empty: bool = False,
+                      check_cancel: Callable[[], bool] = None) -> Tuple[Optional[bytes], Dict]:
+        """
+        Generate audio and return data + usage stats.
+        Routes to specific service based on config.
+        """
+        usage_stats = {'input_tokens': 0, 'output_tokens': 0}
+        
+        if not text or not text.strip():
+            return None, usage_stats
+
         for attempt in range(max_retries):
             if check_cancel and check_cancel():
                 return None, usage_stats
 
             try:
-                audio_chunks = []
-                mime_type = None
-                
-                # We can't interrupt the generator easily once it starts, but it yields chunks
-                for chunk in self.client.models.generate_content_stream(
-                    model=model,
-                    contents=contents,
-                    config=generate_content_config,
-                ):
-                    if check_cancel and check_cancel():
-                        return None, usage_stats
-
-                    if hasattr(chunk, 'usage_metadata') and chunk.usage_metadata:
-                        usage_stats['input_tokens'] = chunk.usage_metadata.prompt_token_count or 0
-                        usage_stats['output_tokens'] = chunk.usage_metadata.candidates_token_count or 0
-
-                    if (chunk.candidates and 
-                        chunk.candidates[0].content and 
-                        chunk.candidates[0].content.parts):
-                        
-                        part = chunk.candidates[0].content.parts[0]
-                        
-                        if part.inline_data and part.inline_data.data:
-                            audio_chunks.append(part.inline_data.data)
-                            if not mime_type:
-                                mime_type = part.inline_data.mime_type
-                                
-                if audio_chunks:
-                    audio_data = b''.join(audio_chunks)
-                    ext = mimetypes.guess_extension(mime_type) if mime_type else None
-                    if ext is None or 'wav' not in str(ext).lower():
-                        final_audio = self.convert_to_wav(audio_data, mime_type or "audio/wav")
-                        return final_audio, usage_stats
-                    return audio_data, usage_stats
-                
-                if retry_on_empty:
-                    raise EmptyResponseError("Received empty audio stream from API.")
-                
-                return None, usage_stats
+                if self.service == 'elevenlabs':
+                    return self._generate_elevenlabs(text, check_cancel)
+                else:
+                    return self._generate_gemini(text, model, retry_on_empty, check_cancel)
                 
             except Exception as e:
                 # Immediate exit if cancelled
@@ -112,15 +212,14 @@ class TTSProcessor:
                     return None, usage_stats
 
                 error_msg = str(e).lower()
-                
-                if '429' in error_msg or 'resource_exhausted' in error_msg:
-                    raise RateLimitError(str(e))
+                is_rate_limit = isinstance(e, RateLimitError) or '429' in error_msg
                 
                 is_retryable = (
                     '500' in error_msg or 
                     '503' in error_msg or 
                     'timeout' in error_msg or 
-                    isinstance(e, EmptyResponseError)
+                    isinstance(e, EmptyResponseError) or
+                    is_rate_limit 
                 )
 
                 if is_retryable:
@@ -133,6 +232,9 @@ class TTSProcessor:
                             time.sleep(0.1)
                         continue
                 
+                if is_rate_limit:
+                    raise RateLimitError(str(e))
+                
                 if isinstance(e, EmptyResponseError):
                     return None, usage_stats
 
@@ -141,7 +243,7 @@ class TTSProcessor:
         return None, usage_stats
         
     def convert_to_wav(self, audio_data: bytes, mime_type: str) -> bytes:
-        """Convert raw audio data to WAV format"""
+        """Convert raw audio data to WAV format if needed (Helper for Gemini)"""
         parameters = self.parse_audio_mime_type(mime_type)
         bits_per_sample = parameters["bits_per_sample"]
         sample_rate = parameters["rate"]
@@ -202,16 +304,21 @@ class TTSProcessor:
         """
         Generate audio with automatic fallback. Returns (audio, model_name, usage_stats)
         """
+        # FIX: Determine which model to report on success
+        reported_model = primary_model
+        if self.service == 'elevenlabs':
+            reported_model = self.el_model
+
         try:
+            # Primary attempt
             audio, stats = self.generate_audio(text, primary_model, max_retries, retry_delay, retry_on_empty, check_cancel)
             if audio:
-                return audio, primary_model, stats
+                return audio, reported_model, stats
             return None, "No audio generated", stats
             
         except RateLimitError as e:
-            if enable_fallback:
+            if enable_fallback and self.service == 'gemini':
                 try:
-                    # Brief wait before fallback
                     if check_cancel and not check_cancel():
                         time.sleep(1)
                     

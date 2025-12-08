@@ -88,6 +88,7 @@ class ConfigDialog(QDialog):
         
     def get_default_profile(self):
         return {
+            'service': 'gemini',
             'api_key': '',
             'primary_model': 'gemini-2.5-flash-tts',
             'fallback_model': 'gemini-2.5-flash-tts',
@@ -95,6 +96,13 @@ class ConfigDialog(QDialog):
             'voice_name': 'Zephyr',
             'temperature': 1.0,
             'system_instruction': '',
+            'elevenlabs': {
+                'api_key': '',
+                'voice_id': 'JBFqnCBsd6RMkjVDRZzb',
+                'model_id': 'eleven_turbo_v2_5',
+                'stability': 0.5,
+                'similarity_boost': 0.75
+            },
             'note_type_configs': [],
             'skip_existing_audio': True,
             'retry_attempts': 3,
@@ -107,9 +115,9 @@ class ConfigDialog(QDialog):
         }
         
     def setup_ui(self):
-        self.setWindowTitle("Gemini TTS Configuration")
+        self.setWindowTitle("TTS Configuration")
         self.setMinimumWidth(600)
-        self.setMinimumHeight(550)
+        self.setMinimumHeight(600)
         
         main_layout = QVBoxLayout()
         
@@ -140,7 +148,7 @@ class ConfigDialog(QDialog):
         
         self.tab_api = QWidget()
         self.setup_api_tab()
-        self.tabs.addTab(self.tab_api, "API & Voice")
+        self.tabs.addTab(self.tab_api, "Service & API")
         
         self.tab_notes = QWidget()
         self.setup_notes_tab()
@@ -161,39 +169,76 @@ class ConfigDialog(QDialog):
 
     def setup_api_tab(self):
         layout = QVBoxLayout()
-        form = QFormLayout()
+        
+        # Service Selector
+        top_h = QHBoxLayout()
+        top_h.addWidget(QLabel("TTS Service:"))
+        self.service_combo = QComboBox()
+        self.service_combo.addItems(["Gemini", "ElevenLabs"])
+        self.service_combo.currentTextChanged.connect(self.on_service_change)
+        top_h.addWidget(self.service_combo, 1)
+        layout.addLayout(top_h)
+        
+        # --- GEMINI SETTINGS ---
+        self.gemini_group = QGroupBox("Gemini Settings")
+        g_form = QFormLayout()
         
         self.api_key = QLineEdit()
         self.api_key.setEchoMode(QLineEdit.EchoMode.Normal)
         self.api_key.setPlaceholderText("Enter your Gemini API Key")
-        form.addRow("Gemini API Key:", self.api_key)
+        g_form.addRow("API Key:", self.api_key)
         
         self.primary_model = QLineEdit()
-        form.addRow("Primary Model:", self.primary_model)
+        g_form.addRow("Primary Model:", self.primary_model)
         
         self.fallback_model = QLineEdit()
-        form.addRow("Fallback Model:", self.fallback_model)
+        g_form.addRow("Fallback Model:", self.fallback_model)
         
         self.enable_fallback = QCheckBox("Enable fallback on rate limit")
-        form.addRow("", self.enable_fallback)
+        g_form.addRow("", self.enable_fallback)
         
         self.voice_name = QLineEdit()
-        form.addRow("Voice Name:", self.voice_name)
+        g_form.addRow("Voice Name:", self.voice_name)
         
         self.temperature = QDoubleSpinBox()
         self.temperature.setRange(0.0, 2.0)
         self.temperature.setSingleStep(0.1)
-        form.addRow("Temperature:", self.temperature)
-        
-        layout.addLayout(form)
-        
-        layout.addWidget(QLabel("System Instructions (Optional):"))
+        g_form.addRow("Temperature:", self.temperature)
+
         self.system_instruction = QTextEdit()
         self.system_instruction.setPlaceholderText("E.g., Speak slowly.")
-        self.system_instruction.setMaximumHeight(80)
-        layout.addWidget(self.system_instruction)
+        self.system_instruction.setMaximumHeight(60)
+        g_form.addRow("System Instr:", self.system_instruction)
+        
+        self.gemini_group.setLayout(g_form)
+        layout.addWidget(self.gemini_group)
+        
+        # --- ELEVENLABS SETTINGS ---
+        self.eleven_group = QGroupBox("ElevenLabs Settings")
+        e_form = QFormLayout()
+        
+        self.el_api_key = QLineEdit()
+        self.el_api_key.setPlaceholderText("Enter ElevenLabs API Key")
+        e_form.addRow("API Key:", self.el_api_key)
+        
+        self.el_voice_id = QLineEdit()
+        self.el_voice_id.setPlaceholderText("e.g. 21m00Tcm4TlvDq8ikWAM")
+        e_form.addRow("Voice ID:", self.el_voice_id)
+        
+        self.el_model_id = QLineEdit()
+        self.el_model_id.setPlaceholderText("e.g. eleven_turbo_v2_5")
+        e_form.addRow("Model ID:", self.el_model_id)
+        
+        self.eleven_group.setLayout(e_form)
+        layout.addWidget(self.eleven_group)
+        
         layout.addStretch()
         self.tab_api.setLayout(layout)
+
+    def on_service_change(self, service_name):
+        is_gemini = (service_name == "Gemini")
+        self.gemini_group.setVisible(is_gemini)
+        self.eleven_group.setVisible(not is_gemini)
 
     def setup_notes_tab(self):
         layout = QVBoxLayout()
@@ -257,8 +302,8 @@ class ConfigDialog(QDialog):
         self.stat_input = QLabel("0")
         self.stat_output = QLabel("0")
         stats_layout.addRow("Total Requests:", self.stat_requests)
-        stats_layout.addRow("Input Tokens:", self.stat_input)
-        stats_layout.addRow("Output Tokens:", self.stat_output)
+        stats_layout.addRow("Input Tokens/Chars:", self.stat_input)
+        stats_layout.addRow("Output Tokens/Approx:", self.stat_output)
         group_stats.setLayout(stats_layout)
         layout.addWidget(group_stats)
         
@@ -281,7 +326,9 @@ class ConfigDialog(QDialog):
             item = self.note_configs.item(i)
             note_configs.append(item.data(0x0100))
 
-        self.profiles[self.current_profile_name] = {
+        # Save Gemini settings
+        profile_data = {
+            'service': self.service_combo.currentText().lower(),
             'api_key': self.api_key.text(),
             'primary_model': self.primary_model.text(),
             'fallback_model': self.fallback_model.text(),
@@ -300,12 +347,33 @@ class ConfigDialog(QDialog):
             'stats': current_stats
         }
 
+        # Save ElevenLabs settings
+        profile_data['elevenlabs'] = {
+            'api_key': self.el_api_key.text(),
+            'voice_id': self.el_voice_id.text(),
+            'model_id': self.el_model_id.text(),
+            # Preserve hidden options if they existed
+            'stability': self.profiles[self.current_profile_name].get('elevenlabs', {}).get('stability', 0.5),
+            'similarity_boost': self.profiles[self.current_profile_name].get('elevenlabs', {}).get('similarity_boost', 0.75)
+        }
+
+        self.profiles[self.current_profile_name] = profile_data
+
     def load_profile(self, name):
         p = self.profiles.get(name, self.get_default_profile())
         self.profile_combo.blockSignals(True)
         self.profile_combo.setCurrentText(name)
         self.profile_combo.blockSignals(False)
         
+        # Load Service
+        svc = p.get('service', 'gemini').title()
+        if svc not in ["Gemini", "Elevenlabs"]: svc = "Gemini"
+        if svc == "Elevenlabs": svc = "ElevenLabs" # casing fix
+        
+        self.service_combo.setCurrentText(svc)
+        self.on_service_change(svc)
+        
+        # Load Gemini
         self.api_key.setText(p.get('api_key', ''))
         self.primary_model.setText(p.get('primary_model', 'gemini-2.5-flash-tts'))
         self.fallback_model.setText(p.get('fallback_model', 'gemini-2.5-flash-tts'))
@@ -314,6 +382,13 @@ class ConfigDialog(QDialog):
         self.temperature.setValue(p.get('temperature', 1.0))
         self.system_instruction.setText(p.get('system_instruction', ''))
         
+        # Load ElevenLabs
+        el = p.get('elevenlabs', {})
+        self.el_api_key.setText(el.get('api_key', ''))
+        self.el_voice_id.setText(el.get('voice_id', 'JBFqnCBsd6RMkjVDRZzb'))
+        self.el_model_id.setText(el.get('model_id', 'eleven_turbo_v2_5'))
+        
+        # Common
         self.skip_existing.setChecked(p.get('skip_existing_audio', True))
         self.retry_attempts.setValue(p.get('retry_attempts', 3))
         self.retry_delay.setValue(p.get('retry_delay', 2))

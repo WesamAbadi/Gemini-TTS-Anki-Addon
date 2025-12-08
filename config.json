@@ -1,7 +1,8 @@
 {
+    "service": "gemini",
     "api_key": "",
-    "primary_model": "gemini-2.5-pro-preview-tts",
-    "fallback_model": "gemini-2.5-flash-preview-tts",
+    "primary_model": "gemini-2.5-flash-tts",
+    "fallback_model": "gemini-2.5-flash-tts",
     "enable_fallback": true,
     "voice_name": "Zephyr",
     "temperature": 1.0,
@@ -12,5 +13,12 @@
     "note_type_configs": [],
     "skip_existing_audio": true,
     "retry_attempts": 3,
-    "retry_delay": 2
+    "retry_delay": 2,
+    "elevenlabs": {
+        "api_key": "",
+        "voice_id": "JBFqnCBsd6RMkjVDRZzb",
+        "model_id": "eleven_turbo_v2_5",
+        "stability": 0.5,
+        "similarity_boost": 0.75
+    }
 }

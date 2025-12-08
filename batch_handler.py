@@ -19,7 +19,7 @@ class ProgressDialog(QDialog):
         self.handler_ref = None
         
     def setup_ui(self, total_notes: int):
-        self.setWindowTitle("Processing Gemini TTS")
+        self.setWindowTitle("Processing TTS")
         self.setMinimumWidth(700)
         self.setMinimumHeight(550)
         self.setWindowModality(Qt.WindowModality.ApplicationModal)
@@ -55,7 +55,6 @@ class ProgressDialog(QDialog):
         font = QFont("Consolas", 10)
         font.setStyleHint(QFont.StyleHint.Monospace)
         self.log_text.setFont(font)
-        # self.log_text.setStyleSheet("QTextEdit { background-color: #f5f5f5; border: 1px solid #ccc; }")
         layout.addWidget(self.log_text)
         
         self.cancel_btn = QPushButton("Cancel")
@@ -69,7 +68,8 @@ class ProgressDialog(QDialog):
         self.stats_label.setText(f"Fields Generated: {success} | Skipped: {skipped} | Failed: {failed}")
         
     def update_usage(self, input_tokens, output_tokens):
-        self.usage_label.setText(f"Session Usage - Input: {input_tokens} | Output: {output_tokens}")
+        # Determine label based on service context implicitly or generic text
+        self.usage_label.setText(f"Session Usage - Input: {input_tokens} chars/tokens | Output: {output_tokens} (approx)")
         
     def add_log_html(self, html_msg: str):
         self.log_text.append(html_msg)
@@ -125,60 +125,8 @@ class TTSWorker(QThread):
             raise container['error']
         return container['result']
 
-    def _format_duration(self, seconds: float) -> str:
-        if seconds < 1: return f"{int(seconds*1000)}ms"
-        if seconds < 60: return f"{seconds:.1f}s"
-        
-        minutes = int(seconds // 60)
-        rem_sec = int(seconds % 60)
-        if minutes < 60: return f"{minutes}m {rem_sec}s"
-        
-        hours = int(minutes // 60)
-        rem_min = int(minutes % 60)
-        return f"{hours}h {rem_min}m"
-
     def _format_error(self, error_str: str) -> str:
-        """Parses Google GenAI errors into clean HTML"""
         error_str = str(error_str)
-        
-        # Check for 429 / Resource Exhausted
-        if '429' in error_str or 'RESOURCE_EXHAUSTED' in error_str:
-            # Extract Wait Time
-            wait_msg = "Unknown"
-            match_wait = re.search(r"retry in\s*([\d\.]+)(s|ms)", error_str)
-            if match_wait:
-                val = float(match_wait.group(1))
-                unit = match_wait.group(2)
-                if unit == 'ms': val /= 1000
-                wait_msg = self._format_duration(val)
-            
-            # Extract Limit info
-            limit_msg = ""
-            match_limit = re.search(r"limit:\s*(\d+)", error_str)
-            if match_limit:
-                limit_msg = f" (Limit: {match_limit.group(1)})"
-
-            # Determine Quota Type
-            quota_type = "Rate Limit"
-            if "PerDay" in error_str:
-                quota_type = "Daily Quota"
-            elif "PerMinute" in error_str:
-                quota_type = "Minute Quota"
-
-            return f"<b>{quota_type} Hit</b>{limit_msg}. Waiting <b>{wait_msg}</b>..."
-
-        # Server Errors
-        if '500' in error_str or '503' in error_str:
-            return "<b>Server Error:</b> Google internal error. Retrying..."
-
-        # JSON Message Extraction
-        try:
-            if '{' in error_str and '}' in error_str:
-                match_msg = re.search(r"'message':\s*'([^']*)'", error_str)
-                if match_msg:
-                    return f"API Error: {match_msg.group(1)}"
-        except: pass
-
         if len(error_str) > 150:
             return f"Error: {error_str[:150]}..."
         return f"Error: {error_str}"
@@ -271,11 +219,11 @@ class TTSWorker(QThread):
                 error_msg = ""
 
                 try:
-                    # processor catches its own exceptions and returns error string in model_info
+                    # Pass specific models only if using Gemini, otherwise processor handles it based on service
                     audio_data, model_info, stats = self.processor.generate_with_fallback(
                         clean_text,
-                        self.config['primary_model'],
-                        self.config['fallback_model'],
+                        self.config.get('primary_model', ''),
+                        self.config.get('fallback_model', ''),
                         self.config.get('enable_fallback', True),
                         self.config.get('retry_attempts', 3),
                         self.config.get('retry_delay', 2),
@@ -291,14 +239,15 @@ class TTSWorker(QThread):
                         self.usage_update.emit(self.total_input_tokens, self.total_output_tokens)
                 
                 except Exception as e:
-                    # This only catches unexpected crashes in the wrapper logic
                     error_msg = self._format_error(str(e))
                     model_info = error_msg
 
                 if audio_data:
                     consecutive_errors = 0
-                    def save_result(nid=note_id, t_field=tgt, data=audio_data, tag=tag_on_success):
-                        filename = f"gemini_tts_{nid}_{int(time.time()*1000)}.wav"
+                    prefix = "elevenlabs" if self.processor.service == "elevenlabs" else "gemini"
+                    
+                    def save_result(nid=note_id, t_field=tgt, data=audio_data, tag=tag_on_success, pfx=prefix):
+                        filename = f"{pfx}_tts_{nid}_{int(time.time()*1000)}.wav"
                         mw.col.media.write_data(filename, data)
                         try:
                             n = mw.col.get_note(nid)
@@ -312,7 +261,7 @@ class TTSWorker(QThread):
                         success, msg = self._run_on_main_sync(save_result)
                         if success:
                             success_ops += 1
-                            self.log_html_update.emit(f"Note {note_id} ({src}): <span style='color:green; font-weight:bold'>Success</span>")
+                            self.log_html_update.emit(f"Note {note_id} ({src}): <span style='color:green; font-weight:bold'>Success ({model_info})</span>")
                         else:
                             failed_ops += 1
                             self.log_html_update.emit(f"<span style='color:red'>Note {note_id} ({src}): Save Error - {msg}</span>")
@@ -322,16 +271,7 @@ class TTSWorker(QThread):
                 else:
                     consecutive_errors += 1
                     failed_ops += 1
-                    
-                    # FIX: Format the returned error message if it wasn't caught by the except block
-                    if not error_msg and model_info:
-                        # The processor returns the raw error string in model_info
-                        display_err = self._format_error(model_info)
-                    elif error_msg:
-                        display_err = error_msg
-                    else:
-                        display_err = "Unknown API Error"
-                        
+                    display_err = error_msg if error_msg else self._format_error(model_info)
                     self.log_html_update.emit(f"Note {note_id} ({src}): <span style='color:red'>{display_err}</span>")
 
             self.progress_update.emit(idx + 1, "Waiting...", success_ops, failed_ops, skipped_ops)
@@ -340,7 +280,7 @@ class TTSWorker(QThread):
         summary += f"<span style='color:green'>Success (Fields): {success_ops}</span><br>"
         summary += f"<span style='color:gray'>Skipped: {skipped_ops}</span><br>"
         summary += f"<span style='color:red'>Failed: {failed_ops}</span><br>"
-        summary += f"<i>Session Tokens: Input {self.total_input_tokens}, Output {self.total_output_tokens}</i>"
+        summary += f"<i>Session Usage: Input {self.total_input_tokens}, Output {self.total_output_tokens}</i>"
         
         final_stats = {
             'requests': self.total_requests,
@@ -361,6 +301,7 @@ class BatchTTSHandler:
         self.profile_name = self.global_config.get('current_profile', 'Default')
         profiles = self.global_config.get('profiles', {})
         
+        # Backward compatibility for old config structure
         if not profiles and 'api_key' in self.global_config:
             self.active_config = self.global_config
         else:
@@ -371,6 +312,7 @@ class BatchTTSHandler:
             
     def get_default_config(self):
         return {
+            'service': 'gemini',
             'api_key': '',
             'primary_model': 'gemini-2.5-flash-tts',
             'fallback_model': 'gemini-2.5-flash-tts',
@@ -382,25 +324,48 @@ class BatchTTSHandler:
             'verbose_logging': False,
             'tag_on_success': '',
             'note_type_configs': [],
-            'stats': {'requests': 0, 'input_tokens': 0, 'output_tokens': 0}
+            'stats': {'requests': 0, 'input_tokens': 0, 'output_tokens': 0},
+            'elevenlabs': {
+                'api_key': '',
+                'voice_id': 'JBFqnCBsd6RMkjVDRZzb', 
+                'model_id': 'eleven_turbo_v2_5',
+                'stability': 0.5,
+                'similarity_boost': 0.75
+            }
         }
-        
+    
+    def validate_config(self):
+        service = self.active_config.get('service', 'gemini')
+        if service == 'elevenlabs':
+            el_cfg = self.active_config.get('elevenlabs', {})
+            return bool(el_cfg.get('api_key')) and bool(self.active_config.get('note_type_configs'))
+        else:
+            return bool(self.active_config.get('api_key')) and bool(self.active_config.get('note_type_configs'))
+
     def start(self):
-        if not self.active_config.get('api_key') or not self.active_config.get('note_type_configs'):
+        if not self.validate_config():
             dialog = ConfigDialog(self.mw, self.global_config)
             if dialog.exec():
                 self.global_config = dialog.get_config()
                 self.mw.addonManager.writeConfig(__name__, self.global_config)
+                # Re-init to load new config
                 self.__init__(self.mw, self.note_ids)
-                if not self.active_config.get('api_key'): return 
+                if not self.validate_config(): return 
             else:
                 return
-                
+        
+        service = self.active_config.get('service', 'gemini')
+        el_config = self.active_config.get('elevenlabs', {})
+
         processor = TTSProcessor(
-            api_key=self.active_config['api_key'],
+            service=service,
+            api_key=self.active_config['api_key'], # Gemini key
             voice_name=self.active_config.get('voice_name', 'Zephyr'),
             temperature=self.active_config.get('temperature', 1.0),
-            system_instruction=self.active_config.get('system_instruction', '')
+            system_instruction=self.active_config.get('system_instruction', ''),
+            elevenlabs_api_key=el_config.get('api_key', ''),
+            elevenlabs_voice_id=el_config.get('voice_id', ''),
+            elevenlabs_model=el_config.get('model_id', 'eleven_turbo_v2_5')
         )
         
         self.dialog = ProgressDialog(self.mw, len(self.note_ids))
