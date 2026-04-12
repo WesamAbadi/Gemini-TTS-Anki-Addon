@@ -118,6 +118,7 @@ class ConfigDialog(QDialog):
             'fallback_model': 'gemini-2.5-flash-tts',
             'enable_fallback': True,
             'voice_name': 'Zephyr',
+            'language_code': '',
             'temperature': 1.0,
             'system_instruction': '',
             'elevenlabs': {
@@ -125,7 +126,9 @@ class ConfigDialog(QDialog):
                 'voice_id': 'JBFqnCBsd6RMkjVDRZzb',
                 'model_id': 'eleven_turbo_v2_5',
                 'stability': 0.5,
-                'similarity_boost': 0.75
+                'similarity_boost': 0.75,
+                'speed': 1.0,
+                'language_code': ''
             },
             'note_type_configs': [],
             'skip_existing_audio': True,
@@ -248,6 +251,10 @@ class ConfigDialog(QDialog):
         
         self.voice_name = QLineEdit()
         g_layout.addLayout(self._create_info_row("Voice Name:", self.voice_name))
+
+        self.language_code = QLineEdit()
+        self.language_code.setPlaceholderText("e.g. en-US")
+        g_layout.addLayout(self._create_info_row("Language Code:", self.language_code))
         
         g_layout.addWidget(SectionHeader("Generation Parameters"))
         
@@ -284,6 +291,15 @@ class ConfigDialog(QDialog):
         self.el_model_id = QLineEdit()
         self.el_model_id.setPlaceholderText("e.g. eleven_turbo_v2_5")
         e_layout.addLayout(self._create_info_row("Model ID:", self.el_model_id, "https://elevenlabs.io/docs/api-reference/text-to-speech/convert", "(?) Models"))
+        
+        self.el_language_code = QLineEdit()
+        self.el_language_code.setPlaceholderText("e.g. en")
+        e_layout.addLayout(self._create_info_row("Language Code:", self.el_language_code))
+
+        self.el_speed = QDoubleSpinBox()
+        self.el_speed.setRange(0.7, 1.2)
+        self.el_speed.setSingleStep(0.1)
+        e_layout.addLayout(self._create_info_row("Speed:", self.el_speed))
         
         layout.addWidget(self.eleven_group)
         
@@ -403,6 +419,7 @@ class ConfigDialog(QDialog):
             'fallback_model': self.fallback_model.text(),
             'enable_fallback': self.enable_fallback.isChecked(),
             'voice_name': self.voice_name.text(),
+            'language_code': self.language_code.text(),
             'temperature': self.temperature.value(),
             'system_instruction': self.system_instruction.toPlainText(),
             'note_type_configs': note_configs,
@@ -423,7 +440,9 @@ class ConfigDialog(QDialog):
             'voice_id': self.el_voice_id.text(),
             'model_id': self.el_model_id.text(),
             'stability': self.profiles[self.current_profile_name].get('elevenlabs', {}).get('stability', 0.5),
-            'similarity_boost': self.profiles[self.current_profile_name].get('elevenlabs', {}).get('similarity_boost', 0.75)
+            'similarity_boost': self.profiles[self.current_profile_name].get('elevenlabs', {}).get('similarity_boost', 0.75),
+            'speed': self.el_speed.value(),
+            'language_code': self.el_language_code.text()
         }
 
         self.profiles[self.current_profile_name] = profile_data
@@ -448,6 +467,7 @@ class ConfigDialog(QDialog):
         self.fallback_model.setText(p.get('fallback_model', 'gemini-2.5-flash-tts'))
         self.enable_fallback.setChecked(p.get('enable_fallback', True))
         self.voice_name.setText(p.get('voice_name', 'Zephyr'))
+        self.language_code.setText(p.get('language_code', ''))
         self.temperature.setValue(p.get('temperature', 1.0))
         self.system_instruction.setText(p.get('system_instruction', ''))
         
@@ -456,6 +476,8 @@ class ConfigDialog(QDialog):
         self.el_api_key.setText(el.get('api_key', ''))
         self.el_voice_id.setText(el.get('voice_id', 'JBFqnCBsd6RMkjVDRZzb'))
         self.el_model_id.setText(el.get('model_id', 'eleven_turbo_v2_5'))
+        self.el_language_code.setText(el.get('language_code', ''))
+        self.el_speed.setValue(el.get('speed', 1.0))
         
         # Common
         self.skip_existing.setChecked(p.get('skip_existing_audio', True))

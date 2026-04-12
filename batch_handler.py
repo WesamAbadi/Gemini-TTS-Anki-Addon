@@ -359,6 +359,7 @@ class BatchTTSHandler:
             'fallback_model': 'gemini-2.5-flash-tts',
             'enable_fallback': True,
             'voice_name': 'Zephyr',
+            'language_code': '',
             'temperature': 1.0,
             'request_wait': 0.5,
             'max_concurrent': 1,
@@ -372,7 +373,9 @@ class BatchTTSHandler:
                 'voice_id': 'JBFqnCBsd6RMkjVDRZzb', 
                 'model_id': 'eleven_turbo_v2_5',
                 'stability': 0.5,
-                'similarity_boost': 0.75
+                'similarity_boost': 0.75,
+                'speed': 1.0,
+                'language_code': ''
             }
         }
     
@@ -402,11 +405,14 @@ class BatchTTSHandler:
             service=service,
             api_key=self.active_config['api_key'],
             voice_name=self.active_config.get('voice_name', 'Zephyr'),
+            language_code=self.active_config.get('language_code', ''),
             temperature=self.active_config.get('temperature', 1.0),
             system_instruction=self.active_config.get('system_instruction', ''),
             elevenlabs_api_key=el_config.get('api_key', ''),
             elevenlabs_voice_id=el_config.get('voice_id', ''),
-            elevenlabs_model=el_config.get('model_id', 'eleven_turbo_v2_5')
+            elevenlabs_model=el_config.get('model_id', 'eleven_turbo_v2_5'),
+            elevenlabs_speed=el_config.get('speed', 1.0),
+            elevenlabs_language_code=el_config.get('language_code', '')
         )
         
         # Initialize dialog with estimated note count first

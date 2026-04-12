@@ -23,17 +23,20 @@ class TTSProcessor:
     """Handles TTS generation via Gemini API or ElevenLabs API"""
     
     def __init__(self, service: str = "gemini", api_key: str = "", 
-                 voice_name: str = "Zephyr", temperature: float = 1.0, 
+                 voice_name: str = "Zephyr", language_code: str = "", temperature: float = 1.0, 
                  system_instruction: str = None,
                  elevenlabs_api_key: str = "",
                  elevenlabs_voice_id: str = "",
-                 elevenlabs_model: str = "eleven_turbo_v2_5"):
+                 elevenlabs_model: str = "eleven_turbo_v2_5",
+                 elevenlabs_speed: float = 1.0,
+                 elevenlabs_language_code: str = ""):
         
         self.service = service.lower()
         
         # Gemini Config
         self.api_key = api_key
         self.voice_name = voice_name
+        self.language_code = language_code
         self.temperature = temperature
         self.system_instruction = system_instruction
         self.client = None
@@ -42,6 +45,8 @@ class TTSProcessor:
         self.el_api_key = elevenlabs_api_key
         self.el_voice_id = elevenlabs_voice_id
         self.el_model = elevenlabs_model
+        self.el_speed = elevenlabs_speed
+        self.el_language_code = elevenlabs_language_code
         
     def initialize_client(self):
         """Initialize Gemini client if needed"""
@@ -65,10 +70,16 @@ class TTSProcessor:
             "text": text,
             "model_id": self.el_model,
             "voice_settings": {
-                "stability": 0.5,
-                "similarity_boost": 0.75
+                "stability": 0.8,
+                "similarity_boost": 0.75,
+                "style": 0.0,
+                "use_speaker_boost": True,
+                "speed": self.el_speed
             }
         }
+        
+        if self.el_language_code:
+            data["language_code"] = self.el_language_code
         
         if check_cancel and check_cancel():
             return None, {}
@@ -126,16 +137,20 @@ class TTSProcessor:
             ),
         ]
         
+        speech_config_kwargs = {
+            "voice_config": types.VoiceConfig(
+                prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                    voice_name=self.voice_name
+                )
+            )
+        }
+        if self.language_code:
+            speech_config_kwargs["language_code"] = self.language_code
+            
         generate_content_config = types.GenerateContentConfig(
             temperature=self.temperature,
             response_modalities=["audio"],
-            speech_config=types.SpeechConfig(
-                voice_config=types.VoiceConfig(
-                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                        voice_name=self.voice_name
-                    )
-                )
-            ),
+            speech_config=types.SpeechConfig(**speech_config_kwargs),
         )
         
         audio_chunks = []
