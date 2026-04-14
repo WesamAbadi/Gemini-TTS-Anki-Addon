@@ -1,1 +1,34 @@
+# Anki User Config (DO NOT COMMIT, contains personal API keys)
 meta.json
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Setup / Packaging
+build/
+dist/
+*.egg-info/
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDE / Editor settings
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Temporary outputs
+*.wav
+*.mp3
+*.log
